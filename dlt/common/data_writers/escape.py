@@ -124,7 +124,7 @@ escape_athena_identifier = escape_postgres_identifier
 escape_dremio_identifier = escape_postgres_identifier
 
 
-def escape_bigquery_identifier(v: str) -> str:
+def escape_hive_identifier(v: str) -> str:
     # https://cloud.google.com/bigquery/docs/reference/standard-sql/lexical
     return "`" + v.replace("\\", "\\\\").replace("`", "\\`") + "`"
 
@@ -132,10 +132,10 @@ def escape_bigquery_identifier(v: str) -> str:
 def escape_snowflake_identifier(v: str) -> str:
     # Snowcase uppercase all identifiers unless quoted. Match this here so queries on information schema work without issue
     # See also https://docs.snowflake.com/en/sql-reference/identifiers-syntax#double-quoted-identifiers
-    return escape_postgres_identifier(v.upper())
+    return escape_postgres_identifier(v)
 
 
-escape_databricks_identifier = escape_bigquery_identifier
+escape_databricks_identifier = escape_hive_identifier
 
 
 DATABRICKS_ESCAPE_DICT = {"'": "\\'", "\\": "\\\\", "\n": "\\n", "\r": "\\r"}
@@ -150,10 +150,47 @@ def escape_databricks_literal(v: Any) -> Any:
         return _escape_extended(json.dumps(v), prefix="'", escape_dict=DATABRICKS_ESCAPE_DICT)
     if isinstance(v, bytes):
         return f"X'{v.hex()}'"
-    if v is None:
-        return "NULL"
+    return "NULL" if v is None else str(v)
 
-    return str(v)
+
+# https://github.com/ClickHouse/ClickHouse/blob/master/docs/en/sql-reference/syntax.md#string
+CLICKHOUSE_ESCAPE_DICT = {
+    "'": "''",
+    "\\": "\\\\",
+    "\n": "\\n",
+    "\t": "\\t",
+    "\b": "\\b",
+    "\f": "\\f",
+    "\r": "\\r",
+    "\0": "\\0",
+    "\a": "\\a",
+    "\v": "\\v",
+}
+
+CLICKHOUSE_ESCAPE_RE = _make_sql_escape_re(CLICKHOUSE_ESCAPE_DICT)
+
+
+def escape_clickhouse_literal(v: Any) -> Any:
+    if isinstance(v, str):
+        return _escape_extended(
+            v, prefix="'", escape_dict=CLICKHOUSE_ESCAPE_DICT, escape_re=CLICKHOUSE_ESCAPE_RE
+        )
+    if isinstance(v, (datetime, date, time)):
+        return f"'{v.isoformat()}'"
+    if isinstance(v, (list, dict)):
+        return _escape_extended(
+            json.dumps(v),
+            prefix="'",
+            escape_dict=CLICKHOUSE_ESCAPE_DICT,
+            escape_re=CLICKHOUSE_ESCAPE_RE,
+        )
+    if isinstance(v, bytes):
+        return f"'{v.hex()}'"
+    return "NULL" if v is None else str(v)
+
+
+def escape_clickhouse_identifier(v: str) -> str:
+    return "`" + v.replace("`", "``").replace("\\", "\\\\") + "`"
 
 
 def format_datetime_literal(v: pendulum.DateTime, precision: int = 6, no_tz: bool = False) -> str:
@@ -173,6 +210,17 @@ def format_datetime_literal(v: pendulum.DateTime, precision: int = 6, no_tz: boo
 def format_bigquery_datetime_literal(
     v: pendulum.DateTime, precision: int = 6, no_tz: bool = False
 ) -> str:
-    """Returns BigQuery-adjusted datetime literal by prefixing required `TIMESTAMP` indicator."""
+    """Returns BigQuery-adjusted datetime literal by prefixing required `TIMESTAMP` indicator.
+
+    Also works for Presto-based engines.
+    """
     # https://cloud.google.com/bigquery/docs/reference/standard-sql/lexical#timestamp_literals
     return "TIMESTAMP " + format_datetime_literal(v, precision, no_tz)
+
+
+def format_clickhouse_datetime_literal(
+    v: pendulum.DateTime, precision: int = 6, no_tz: bool = False
+) -> str:
+    """Returns clickhouse compatibel function"""
+    datetime = format_datetime_literal(v, precision, True)
+    return f"toDateTime64({datetime}, {precision}, '{v.tzinfo}')"

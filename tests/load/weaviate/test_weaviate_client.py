@@ -5,6 +5,7 @@ from typing import Iterator, List
 from dlt.common.schema import Schema
 from dlt.common.configuration.container import Container
 from dlt.common.configuration.specs.config_section_context import ConfigSectionContext
+from dlt.common.schema.exceptions import SchemaIdentifierNormalizationCollision
 from dlt.common.utils import uniq_id
 from dlt.common.schema.typing import TWriteDisposition, TColumnSchema, TTableSchemaColumns
 
@@ -13,7 +14,7 @@ from dlt.destinations.impl.weaviate.exceptions import PropertyNameConflict
 from dlt.destinations.impl.weaviate.weaviate_client import WeaviateClient
 
 from dlt.common.storages.file_storage import FileStorage
-from dlt.common.schema.utils import new_table
+from dlt.common.schema.utils import new_table, normalize_table_identifiers
 from tests.load.utils import (
     TABLE_ROW_ALL_DATA_TYPES,
     TABLE_UPDATE,
@@ -37,10 +38,10 @@ def drop_weaviate_schema() -> Iterator[None]:
 
 
 def get_client_instance(schema: Schema) -> WeaviateClient:
-    dest = weaviate(dataset_name="ClientTest" + uniq_id())
-    return dest.client(schema, dest.spec())
-    # with Container().injectable_context(ConfigSectionContext(sections=('destination', 'weaviate'))):
-    #     return dest.client(schema, config)
+    dest = weaviate()
+    return dest.client(
+        schema, dest.spec()._bind_dataset_name(dataset_name="ClientTest" + uniq_id())
+    )
 
 
 @pytest.fixture(scope="function")
@@ -58,11 +59,11 @@ def make_client(naming_convention: str) -> Iterator[WeaviateClient]:
         "test_schema",
         {"names": f"dlt.destinations.impl.weaviate.{naming_convention}", "json": None},
     )
-    _client = get_client_instance(schema)
-    try:
-        yield _client
-    finally:
-        _client.drop_storage()
+    with get_client_instance(schema) as _client:
+        try:
+            yield _client
+        finally:
+            _client.drop_storage()
 
 
 @pytest.fixture
@@ -92,7 +93,7 @@ def test_all_data_types(
     assert len(table_columns) == len(TABLE_UPDATE_COLUMNS_SCHEMA)
     for col_name in table_columns:
         assert col_name in TABLE_UPDATE_COLUMNS_SCHEMA
-        if TABLE_UPDATE_COLUMNS_SCHEMA[col_name]["data_type"] in ["decimal", "complex", "time"]:
+        if TABLE_UPDATE_COLUMNS_SCHEMA[col_name]["data_type"] in ["decimal", "json", "time"]:
             # no native representation
             assert table_columns[col_name]["data_type"] == "text"
         elif TABLE_UPDATE_COLUMNS_SCHEMA[col_name]["data_type"] == "wei":
@@ -114,11 +115,19 @@ def test_case_sensitive_properties_create(client: WeaviateClient) -> None:
         {"name": "coL1", "data_type": "double", "nullable": False},
     ]
     client.schema.update_table(
-        client.schema.normalize_table_identifiers(new_table(class_name, columns=table_create))
+        normalize_table_identifiers(
+            new_table(class_name, columns=table_create), client.schema.naming
+        )
     )
     client.schema._bump_version()
-    with pytest.raises(PropertyNameConflict):
+    with pytest.raises(SchemaIdentifierNormalizationCollision) as clash_ex:
+        client.verify_schema()
         client.update_stored_schema()
+    assert clash_ex.value.identifier_type == "column"
+    assert clash_ex.value.identifier_name == "coL1"
+    assert clash_ex.value.conflict_identifier_name == "col1"
+    assert clash_ex.value.table_name == "ColClass"
+    assert clash_ex.value.naming_name == "dlt.destinations.impl.weaviate.naming"
 
 
 def test_case_insensitive_properties_create(ci_client: WeaviateClient) -> None:
@@ -129,7 +138,9 @@ def test_case_insensitive_properties_create(ci_client: WeaviateClient) -> None:
         {"name": "coL1", "data_type": "double", "nullable": False},
     ]
     ci_client.schema.update_table(
-        ci_client.schema.normalize_table_identifiers(new_table(class_name, columns=table_create))
+        normalize_table_identifiers(
+            new_table(class_name, columns=table_create), ci_client.schema.naming
+        )
     )
     ci_client.schema._bump_version()
     ci_client.update_stored_schema()
@@ -146,16 +157,21 @@ def test_case_sensitive_properties_add(client: WeaviateClient) -> None:
         {"name": "coL1", "data_type": "double", "nullable": False},
     ]
     client.schema.update_table(
-        client.schema.normalize_table_identifiers(new_table(class_name, columns=table_create))
+        normalize_table_identifiers(
+            new_table(class_name, columns=table_create), client.schema.naming
+        )
     )
     client.schema._bump_version()
     client.update_stored_schema()
 
     client.schema.update_table(
-        client.schema.normalize_table_identifiers(new_table(class_name, columns=table_update))
+        normalize_table_identifiers(
+            new_table(class_name, columns=table_update), client.schema.naming
+        )
     )
     client.schema._bump_version()
-    with pytest.raises(PropertyNameConflict):
+    with pytest.raises(SchemaIdentifierNormalizationCollision):
+        client.verify_schema()
         client.update_stored_schema()
 
     # _, table_columns = client.get_storage_table("ColClass")
@@ -171,14 +187,15 @@ def test_load_case_sensitive_data(client: WeaviateClient, file_storage: FileStor
     client.schema.update_table(new_table(class_name, columns=[table_create["col1"]]))
     client.schema._bump_version()
     client.update_stored_schema()
-    # prepare a data item where is name clash due to Weaviate being CI
+    # prepare a data item where is name clash due to Weaviate being CS
     data_clash = {"col1": 72187328, "coL1": 726171}
     # write row
     with io.BytesIO() as f:
         write_dataset(client, f, [data_clash], table_create)
         query = f.getvalue().decode()
-    with pytest.raises(PropertyNameConflict):
-        expect_load_file(client, file_storage, query, class_name)
+    class_name = client.schema.naming.normalize_table_identifier(class_name)
+    job = expect_load_file(client, file_storage, query, class_name, "failed")
+    assert type(job._exception) is PropertyNameConflict  # type: ignore
 
 
 def test_load_case_sensitive_data_ci(ci_client: WeaviateClient, file_storage: FileStorage) -> None:
@@ -202,6 +219,7 @@ def test_load_case_sensitive_data_ci(ci_client: WeaviateClient, file_storage: Fi
     with io.BytesIO() as f:
         write_dataset(ci_client, f, [data_clash], table_create)
         query = f.getvalue().decode()
+    class_name = ci_client.schema.naming.normalize_table_identifier(class_name)
     expect_load_file(ci_client, file_storage, query, class_name)
     response = ci_client.query_class(class_name, ["col1"]).do()
     objects = response["data"]["Get"][ci_client.make_qualified_class_name(class_name)]

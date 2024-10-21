@@ -2,11 +2,25 @@ import os
 import ast
 import contextlib
 import tomlkit
-from typing import Any, Dict, Mapping, NamedTuple, Optional, Tuple, Type, Sequence
+from typing import (
+    Any,
+    Dict,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Type,
+    Sequence,
+    get_args,
+    Literal,
+    get_origin,
+)
 from collections.abc import Mapping as C_Mapping
 
+import yaml
+
 from dlt.common.json import json
-from dlt.common.typing import AnyType, TAny
+from dlt.common.typing import AnyType, DictStrAny, TAny, is_any_type
 from dlt.common.data_types import coerce_value, py_type_to_sc_type
 from dlt.common.configuration.providers import EnvironProvider
 from dlt.common.configuration.exceptions import ConfigValueCannotBeCoercedException, LookupTrace
@@ -31,7 +45,7 @@ _RESOLVED_TRACES: Dict[str, ResolvedValueTrace] = {}  # stores all the resolved 
 
 def deserialize_value(key: str, value: Any, hint: Type[TAny]) -> TAny:
     try:
-        if hint != Any:
+        if not is_any_type(hint):
             # if deserializing to base configuration, try parse the value
             if is_base_configuration_inner_hint(hint):
                 c = hint()
@@ -51,25 +65,35 @@ def deserialize_value(key: str, value: Any, hint: Type[TAny]) -> TAny:
                                 raise
                 return c  # type: ignore
 
+            literal_values: Tuple[Any, ...] = ()
+            if get_origin(hint) is Literal:
+                # Literal fields are validated against the literal values
+                literal_values = get_args(hint)
+                hint_origin = type(literal_values[0])
+            else:
+                hint_origin = hint
+
             # coerce value
-            hint_dt = py_type_to_sc_type(hint)
+            hint_dt = py_type_to_sc_type(hint_origin)
             value_dt = py_type_to_sc_type(type(value))
 
-            # eval only if value is string and hint is "complex"
-            if value_dt == "text" and hint_dt == "complex":
-                if hint is tuple:
+            # eval only if value is string and hint is "json"
+            if value_dt == "text" and hint_dt == "json":
+                if hint_origin is tuple:
                     # use literal eval for tuples
                     value = ast.literal_eval(value)
                 else:
                     # use json for sequences and mappings
                     value = json.loads(value)
                 # exact types must match
-                if not isinstance(value, hint):
+                if not isinstance(value, hint_origin):
                     raise ValueError(value)
             else:
-                # for types that are not complex, reuse schema coercion rules
+                # for types that are not nested, reuse schema coercion rules
                 if value_dt != hint_dt:
                     value = coerce_value(hint_dt, value_dt, value)
+                if literal_values and value not in literal_values:
+                    raise ConfigValueCannotBeCoercedException(key, value, hint)
         return value  # type: ignore
     except ConfigValueCannotBeCoercedException:
         raise
@@ -77,7 +101,7 @@ def deserialize_value(key: str, value: Any, hint: Type[TAny]) -> TAny:
         raise ConfigValueCannotBeCoercedException(key, value, hint) from exc
 
 
-def serialize_value(value: Any) -> Any:
+def serialize_value(value: Any) -> str:
     if value is None:
         raise ValueError(value)
     # return literal for tuples
@@ -85,17 +109,20 @@ def serialize_value(value: Any) -> Any:
         return str(value)
     if isinstance(value, BaseConfiguration):
         try:
-            return value.to_native_representation()
+            return str(value.to_native_representation())
         except NotImplementedError:
             # no native representation: use dict
             value = dict(value)
     # coerce type to text which will use json for mapping and sequences
     value_dt = py_type_to_sc_type(type(value))
-    return coerce_value("text", value_dt, value)
+    return coerce_value("text", value_dt, value)  # type: ignore[no-any-return]
 
 
 def auto_cast(value: str) -> Any:
-    # try to cast to bool, int, float and complex (via JSON)
+    """Parse and cast str `value` to bool, int, float and json
+
+    F[f]alse and T[t]rue strings are cast to bool values
+    """
     if value.lower() == "true":
         return True
     if value.lower() == "false":
@@ -109,9 +136,29 @@ def auto_cast(value: str) -> Any:
         # only lists and dictionaries count
         if isinstance(c_v, (list, dict)):
             return c_v
-    with contextlib.suppress(ValueError):
-        return tomlkit.parse(value)
     return value
+
+
+def auto_config_fragment(value: str) -> Optional[DictStrAny]:
+    """Tries to parse config fragment assuming toml, yaml and json formats
+
+    Only dicts are considered valid fragments.
+    None is returned when not a fragment
+    """
+    try:
+        return tomlkit.parse(value).unwrap()
+    except ValueError:
+        pass
+    with contextlib.suppress(Exception):
+        c_v = yaml.safe_load(value)
+        if isinstance(c_v, dict):
+            return c_v
+    with contextlib.suppress(ValueError):
+        c_v = json.loads(value)
+        # only lists and dictionaries count
+        if isinstance(c_v, dict):
+            return c_v
+    return None
 
 
 def log_traces(
@@ -155,7 +202,10 @@ def add_config_to_env(config: BaseConfiguration, sections: Tuple[str, ...] = ())
 
 
 def add_config_dict_to_env(
-    dict_: Mapping[str, Any], sections: Tuple[str, ...] = (), overwrite_keys: bool = False
+    dict_: Mapping[str, Any],
+    sections: Tuple[str, ...] = (),
+    overwrite_keys: bool = False,
+    destructure_dicts: bool = True,
 ) -> None:
     """Writes values in dict_ back into environment using the naming convention of EnvironProvider. Applies `sections` if specified. Does not overwrite existing keys by default"""
     for k, v in dict_.items():
@@ -170,5 +220,12 @@ def add_config_dict_to_env(
             if env_key not in os.environ or overwrite_keys:
                 if v is None:
                     os.environ.pop(env_key, None)
+                elif isinstance(v, dict) and destructure_dicts:
+                    add_config_dict_to_env(
+                        v,
+                        sections + (k,),
+                        overwrite_keys=overwrite_keys,
+                        destructure_dicts=destructure_dicts,
+                    )
                 else:
                     os.environ[env_key] = serialize_value(v)

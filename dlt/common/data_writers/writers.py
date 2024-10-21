@@ -4,7 +4,6 @@ from typing import (
     IO,
     TYPE_CHECKING,
     Any,
-    ClassVar,
     Dict,
     List,
     Literal,
@@ -17,8 +16,7 @@ from typing import (
 )
 
 from dlt.common.json import json
-from dlt.common.configuration import configspec, known_sections, with_config
-from dlt.common.configuration.specs import BaseConfiguration
+from dlt.common.configuration import with_config
 from dlt.common.data_writers.exceptions import (
     SpecLookupFailed,
     DataWriterNotFound,
@@ -26,15 +24,27 @@ from dlt.common.data_writers.exceptions import (
     FileSpecNotFound,
     InvalidDataItem,
 )
-from dlt.common.destination import DestinationCapabilitiesContext, TLoaderFileFormat
+from dlt.common.data_writers.configuration import (
+    CsvFormatConfiguration,
+    CsvQuoting,
+    ParquetFormatConfiguration,
+)
+from dlt.common.destination import (
+    DestinationCapabilitiesContext,
+    TLoaderFileFormat,
+    LOADER_FILE_FORMATS,
+)
+from dlt.common.metrics import DataWriterMetrics
 from dlt.common.schema.typing import TTableSchemaColumns
-from dlt.common.typing import StrAny
+from dlt.common.schema.utils import is_nullable_column
+from dlt.common.typing import StrAny, TDataItem
+
 
 if TYPE_CHECKING:
     from dlt.common.libs.pyarrow import pyarrow as pa
 
 
-TDataItemFormat = Literal["arrow", "object"]
+TDataItemFormat = Literal["arrow", "object", "file"]
 TWriter = TypeVar("TWriter", bound="DataWriter")
 
 
@@ -51,25 +61,6 @@ class FileWriterSpec(NamedTuple):
     supports_compression: bool = False
 
 
-class DataWriterMetrics(NamedTuple):
-    file_path: str
-    items_count: int
-    file_size: int
-    created: float
-    last_modified: float
-
-    def __add__(self, other: Tuple[object, ...], /) -> Tuple[object, ...]:
-        if isinstance(other, DataWriterMetrics):
-            return DataWriterMetrics(
-                "",  # path is not known
-                self.items_count + other.items_count,
-                self.file_size + other.file_size,
-                min(self.created, other.created),
-                max(self.last_modified, other.last_modified),
-            )
-        return NotImplemented
-
-
 EMPTY_DATA_WRITER_METRICS = DataWriterMetrics("", 0, 0, 2**32, 0.0)
 
 
@@ -82,8 +73,8 @@ class DataWriter(abc.ABC):
     def write_header(self, columns_schema: TTableSchemaColumns) -> None:  # noqa
         pass
 
-    def write_data(self, rows: Sequence[Any]) -> None:
-        self.items_count += len(rows)
+    def write_data(self, items: Sequence[TDataItem]) -> None:
+        self.items_count += len(items)
 
     def write_footer(self) -> None:  # noqa
         pass
@@ -91,9 +82,9 @@ class DataWriter(abc.ABC):
     def close(self) -> None:  # noqa
         pass
 
-    def write_all(self, columns_schema: TTableSchemaColumns, rows: Sequence[Any]) -> None:
+    def write_all(self, columns_schema: TTableSchemaColumns, items: Sequence[TDataItem]) -> None:
         self.write_header(columns_schema)
-        self.write_data(rows)
+        self.write_data(items)
         self.write_footer()
 
     @classmethod
@@ -124,6 +115,9 @@ class DataWriter(abc.ABC):
             return "object"
         elif extension == "parquet":
             return "arrow"
+        # those files may be imported by normalizer as is
+        elif extension in LOADER_FILE_FORMATS:
+            return "file"
         else:
             raise ValueError(f"Cannot figure out data item format for extension {extension}")
 
@@ -132,6 +126,8 @@ class DataWriter(abc.ABC):
         try:
             return WRITER_SPECS[spec]
         except KeyError:
+            if spec.data_item_format == "file":
+                return ImportFileWriter
             raise FileSpecNotFound(spec.file_format, spec.data_item_format, spec)
 
     @staticmethod
@@ -147,10 +143,23 @@ class DataWriter(abc.ABC):
         raise FileFormatForItemFormatNotFound(file_format, data_item_format)
 
 
+class ImportFileWriter(DataWriter):
+    """May only import files, fails on any open/write operations"""
+
+    def write_header(self, columns_schema: TTableSchemaColumns) -> None:
+        raise NotImplementedError(
+            "ImportFileWriter cannot write any files. You have bug in your code."
+        )
+
+    @classmethod
+    def writer_spec(cls) -> FileWriterSpec:
+        raise NotImplementedError("ImportFileWriter has no single spec")
+
+
 class JsonlWriter(DataWriter):
-    def write_data(self, rows: Sequence[Any]) -> None:
-        super().write_data(rows)
-        for row in rows:
+    def write_data(self, items: Sequence[TDataItem]) -> None:
+        super().write_data(items)
+        for row in items:
             json.dump(row, self._f)
             self._f.write(b"\n")
 
@@ -167,12 +176,12 @@ class JsonlWriter(DataWriter):
 
 
 class TypedJsonlListWriter(JsonlWriter):
-    def write_data(self, rows: Sequence[Any]) -> None:
+    def write_data(self, items: Sequence[TDataItem]) -> None:
         # skip JsonlWriter when calling super
-        super(JsonlWriter, self).write_data(rows)
+        super(JsonlWriter, self).write_data(items)
         # write all rows as one list which will require to write just one line
         # encode types with PUA characters
-        json.typed_dump(rows, self._f)
+        json.typed_dump(items, self._f)
         self._f.write(b"\n")
 
     @classmethod
@@ -214,11 +223,11 @@ class InsertValuesWriter(DataWriter):
         if self.writer_type == "default":
             self._f.write("VALUES\n")
 
-    def write_data(self, rows: Sequence[Any]) -> None:
-        super().write_data(rows)
+    def write_data(self, items: Sequence[TDataItem]) -> None:
+        super().write_data(items)
 
         # do not write empty rows, such things may be produced by Arrow adapters
-        if len(rows) == 0:
+        if len(items) == 0:
             return
 
         def write_row(row: StrAny, last_row: bool = False) -> None:
@@ -236,11 +245,11 @@ class InsertValuesWriter(DataWriter):
             self._f.write(self.sep)
 
         # write rows
-        for row in rows[:-1]:
+        for row in items[:-1]:
             write_row(row)
 
         # write last row without separator so we can write footer eventually
-        write_row(rows[-1], last_row=True)
+        write_row(items[-1], last_row=True)
         self._chunks_written += 1
 
     def write_footer(self) -> None:
@@ -260,21 +269,8 @@ class InsertValuesWriter(DataWriter):
         )
 
 
-@configspec
-class ParquetDataWriterConfiguration(BaseConfiguration):
-    flavor: Optional[str] = None  # could be ie. "spark"
-    version: Optional[str] = "2.4"
-    data_page_size: Optional[int] = None
-    timestamp_timezone: str = "UTC"
-    row_group_size: Optional[int] = None
-    coerce_timestamps: Optional[Literal["s", "ms", "us", "ns"]] = None
-    allow_truncated_timestamps: bool = False
-
-    __section__: ClassVar[str] = known_sections.DATA_WRITER
-
-
 class ParquetDataWriter(DataWriter):
-    @with_config(spec=ParquetDataWriterConfiguration)
+    @with_config(spec=ParquetFormatConfiguration)
     def __init__(
         self,
         f: IO[Any],
@@ -293,7 +289,7 @@ class ParquetDataWriter(DataWriter):
 
         self.writer: Optional[pyarrow.parquet.ParquetWriter] = None
         self.schema: Optional[pyarrow.Schema] = None
-        self.complex_indices: List[str] = None
+        self.nested_indices: List[str] = None
         self.parquet_flavor = flavor
         self.parquet_version = version
         self.parquet_data_page_size = data_page_size
@@ -324,42 +320,29 @@ class ParquetDataWriter(DataWriter):
         )
 
     def write_header(self, columns_schema: TTableSchemaColumns) -> None:
-        from dlt.common.libs.pyarrow import pyarrow, get_py_arrow_datatype
+        from dlt.common.libs.pyarrow import columns_to_arrow
 
         # build schema
-        self.schema = pyarrow.schema(
-            [
-                pyarrow.field(
-                    name,
-                    get_py_arrow_datatype(
-                        schema_item,
-                        self._caps,
-                        self.timestamp_timezone,
-                    ),
-                    nullable=schema_item.get("nullable", True),
-                )
-                for name, schema_item in columns_schema.items()
-            ]
-        )
-        # find row items that are of the complex type (could be abstracted out for use in other writers?)
-        self.complex_indices = [
-            i for i, field in columns_schema.items() if field["data_type"] == "complex"
+        self.schema = columns_to_arrow(columns_schema, self._caps, self.timestamp_timezone)
+        # find row items that are of the json type (could be abstracted out for use in other writers?)
+        self.nested_indices = [
+            i for i, field in columns_schema.items() if field["data_type"] == "json"
         ]
         self.writer = self._create_writer(self.schema)
 
-    def write_data(self, rows: Sequence[Any]) -> None:
-        super().write_data(rows)
+    def write_data(self, items: Sequence[TDataItem]) -> None:
+        super().write_data(items)
         from dlt.common.libs.pyarrow import pyarrow
 
-        # replace complex types with json
-        for key in self.complex_indices:
-            for row in rows:
+        # serialize json types and replace with strings
+        for key in self.nested_indices:
+            for row in items:
                 if (value := row.get(key)) is not None:
                     # TODO: make this configurable
                     if value is not None and not isinstance(value, str):
                         row[key] = json.dumps(value)
 
-        table = pyarrow.Table.from_pylist(rows, schema=self.schema)
+        table = pyarrow.Table.from_pylist(items, schema=self.schema)
         # Write
         self.writer.write_table(table, row_group_size=self.parquet_row_group_size)
 
@@ -381,20 +364,8 @@ class ParquetDataWriter(DataWriter):
         )
 
 
-CsvQuoting = Literal["quote_all", "quote_needed"]
-
-
-@configspec
-class CsvDataWriterConfiguration(BaseConfiguration):
-    delimiter: str = ","
-    include_header: bool = True
-    quoting: CsvQuoting = "quote_needed"
-
-    __section__: ClassVar[str] = known_sections.DATA_WRITER
-
-
 class CsvWriter(DataWriter):
-    @with_config(spec=CsvDataWriterConfiguration)
+    @with_config(spec=CsvFormatConfiguration)
     def __init__(
         self,
         f: IO[Any],
@@ -431,20 +402,20 @@ class CsvWriter(DataWriter):
         )
         if self.include_header:
             self.writer.writeheader()
-        # find row items that are of the complex type (could be abstracted out for use in other writers?)
-        self.complex_indices = [
-            i for i, field in columns_schema.items() if field["data_type"] == "complex"
+        # find row items that are of the json type
+        self.nested_indices = [
+            i for i, field in columns_schema.items() if field["data_type"] == "json"
         ]
-        # find row items that are of the complex type (could be abstracted out for use in other writers?)
+        # find row items that are of the binary type
         self.bytes_indices = [
             i for i, field in columns_schema.items() if field["data_type"] == "binary"
         ]
 
-    def write_data(self, rows: Sequence[Any]) -> None:
+    def write_data(self, items: Sequence[TDataItem]) -> None:
         # convert bytes and json
-        if self.complex_indices or self.bytes_indices:
-            for row in rows:
-                for key in self.complex_indices:
+        if self.nested_indices or self.bytes_indices:
+            for row in items:
+                for key in self.nested_indices:
                     if (value := row.get(key)) is not None:
                         row[key] = json.dumps(value)
                 for key in self.bytes_indices:
@@ -462,9 +433,9 @@ class CsvWriter(DataWriter):
                                 " type as binary.",
                             )
 
-        self.writer.writerows(rows)
+        self.writer.writerows(items)
         # count rows that got written
-        self.items_count += sum(len(row) for row in rows)
+        self.items_count += sum(len(row) for row in items)
 
     def close(self) -> None:
         self.writer = None
@@ -488,20 +459,21 @@ class ArrowToParquetWriter(ParquetDataWriter):
         # Schema will be written as-is from the arrow table
         self._column_schema = columns_schema
 
-    def write_data(self, rows: Sequence[Any]) -> None:
-        from dlt.common.libs.pyarrow import pyarrow
+    def write_data(self, items: Sequence[TDataItem]) -> None:
+        from dlt.common.libs.pyarrow import concat_batches_and_tables_in_order
 
-        for row in rows:
-            if not self.writer:
-                self.writer = self._create_writer(row.schema)
-            if isinstance(row, pyarrow.Table):
-                self.writer.write_table(row, row_group_size=self.parquet_row_group_size)
-            elif isinstance(row, pyarrow.RecordBatch):
-                self.writer.write_batch(row, row_group_size=self.parquet_row_group_size)
-            else:
-                raise ValueError(f"Unsupported type {type(row)}")
-            # count rows that got written
-            self.items_count += row.num_rows
+        if not items:
+            return
+        # concat batches and tables into a single one, preserving order
+        # pyarrow writer starts a row group for each item it writes (even with 0 rows)
+        # it also converts batches into tables internally. by creating a single table
+        # we allow the user rudimentary control over row group size via max buffered items
+        table = concat_batches_and_tables_in_order(items)
+        self.items_count += table.num_rows
+        if not self.writer:
+            self.writer = self._create_writer(table.schema)
+        # write concatenated tables
+        self.writer.write_table(table, row_group_size=self.parquet_row_group_size)
 
     def write_footer(self) -> None:
         if not self.writer:
@@ -525,7 +497,7 @@ class ArrowToParquetWriter(ParquetDataWriter):
 
 
 class ArrowToCsvWriter(DataWriter):
-    @with_config(spec=CsvDataWriterConfiguration)
+    @with_config(spec=CsvFormatConfiguration)
     def __init__(
         self,
         f: IO[Any],
@@ -545,12 +517,12 @@ class ArrowToCsvWriter(DataWriter):
     def write_header(self, columns_schema: TTableSchemaColumns) -> None:
         self._columns_schema = columns_schema
 
-    def write_data(self, rows: Sequence[Any]) -> None:
+    def write_data(self, items: Sequence[TDataItem]) -> None:
         from dlt.common.libs.pyarrow import pyarrow
         import pyarrow.csv
 
-        for row in rows:
-            if isinstance(row, (pyarrow.Table, pyarrow.RecordBatch)):
+        for item in items:
+            if isinstance(item, (pyarrow.Table, pyarrow.RecordBatch)):
                 if not self.writer:
                     if self.quoting == "quote_needed":
                         quoting = "needed"
@@ -561,14 +533,14 @@ class ArrowToCsvWriter(DataWriter):
                     try:
                         self.writer = pyarrow.csv.CSVWriter(
                             self._f,
-                            row.schema,
+                            item.schema,
                             write_options=pyarrow.csv.WriteOptions(
                                 include_header=self.include_header,
                                 delimiter=self._delimiter_b,
                                 quoting_style=quoting,
                             ),
                         )
-                        self._first_schema = row.schema
+                        self._first_schema = item.schema
                     except pyarrow.ArrowInvalid as inv_ex:
                         if "Unsupported Type" in str(inv_ex):
                             raise InvalidDataItem(
@@ -580,18 +552,18 @@ class ArrowToCsvWriter(DataWriter):
                             )
                         raise
                 # make sure that Schema stays the same
-                if not row.schema.equals(self._first_schema):
+                if not item.schema.equals(self._first_schema):
                     raise InvalidDataItem(
                         "csv",
                         "arrow",
                         "Arrow schema changed without rotating the file. This may be internal"
                         " error or misuse of the writer.\nFirst"
-                        f" schema:\n{self._first_schema}\n\nCurrent schema:\n{row.schema}",
+                        f" schema:\n{self._first_schema}\n\nCurrent schema:\n{item.schema}",
                     )
 
                 # write headers only on the first write
                 try:
-                    self.writer.write(row)
+                    self.writer.write(item)
                 except pyarrow.ArrowInvalid as inv_ex:
                     if "Invalid UTF8 payload" in str(inv_ex):
                         raise InvalidDataItem(
@@ -612,9 +584,9 @@ class ArrowToCsvWriter(DataWriter):
                         )
                     raise
             else:
-                raise ValueError(f"Unsupported type {type(row)}")
+                raise ValueError(f"Unsupported type {type(item)}")
             # count rows that got written
-            self.items_count += row.num_rows
+            self.items_count += item.num_rows
 
     def write_footer(self) -> None:
         if self.writer is None and self.include_header:
@@ -650,8 +622,8 @@ class ArrowToCsvWriter(DataWriter):
 class ArrowToObjectAdapter:
     """A mixin that will convert object writer into arrow writer."""
 
-    def write_data(self, rows: Sequence[Any]) -> None:
-        for batch in rows:
+    def write_data(self, items: Sequence[TDataItem]) -> None:
+        for batch in items:
             # convert to object data item format
             super().write_data(batch.to_pylist())  # type: ignore[misc]
 
@@ -783,3 +755,16 @@ def get_best_writer_spec(
         return DataWriter.class_factory(file_format, item_format, native_writers).writer_spec()
     except DataWriterNotFound:
         return DataWriter.class_factory(file_format, item_format, ALL_WRITERS).writer_spec()
+
+
+def create_import_spec(
+    item_file_format: TLoaderFileFormat,
+    possible_file_formats: Sequence[TLoaderFileFormat],
+) -> FileWriterSpec:
+    """Creates writer spec that may be used only to import files"""
+    # can the item file be directly imported?
+    if item_file_format not in possible_file_formats:
+        raise SpecLookupFailed("file", possible_file_formats, item_file_format)
+
+    spec = DataWriter.class_factory(item_file_format, "object", ALL_WRITERS).writer_spec()
+    return spec._replace(data_item_format="file")

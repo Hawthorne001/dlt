@@ -1,4 +1,4 @@
-from typing import Any, AnyStr, Dict, List, Sequence, Optional, Iterable, TypedDict
+from typing import Any, AnyStr, Dict, List, Sequence, Optional, Iterable, Type, TypedDict
 
 
 class ExceptionTrace(TypedDict, total=False):
@@ -94,11 +94,25 @@ class SignalReceivedException(KeyboardInterrupt, TerminalException):
 
 
 class DictValidationException(DltException):
-    def __init__(self, msg: str, path: str, field: str = None, value: Any = None) -> None:
+    def __init__(
+        self,
+        msg: str,
+        path: str,
+        expected_type: Type[Any] = None,
+        field: str = None,
+        value: Any = None,
+        nested_exceptions: List["DictValidationException"] = None,
+    ) -> None:
         self.path = path
+        self.expected_type = expected_type
         self.field = field
         self.value = value
+        self.nested_exceptions = nested_exceptions
+        self.msg = msg
         super().__init__(msg)
+
+    def __str__(self) -> str:
+        return f"In path {self.path}: " + self.msg
 
 
 class ArgumentsOverloadException(DltException):
@@ -127,6 +141,25 @@ You must install additional dependencies to run {self.caller}. If you use pip yo
 
     def _to_pip_install(self) -> str:
         return "\n".join([f'pip install "{d}"' for d in self.dependencies])
+
+
+class DependencyVersionException(DltException):
+    def __init__(
+        self, pkg_name: str, version_found: str, version_required: str, appendix: str = ""
+    ) -> None:
+        self.pkg_name = pkg_name
+        self.version_found = version_found
+        self.version_required = version_required
+        super().__init__(self._get_msg(appendix))
+
+    def _get_msg(self, appendix: str) -> str:
+        msg = (
+            f"Found `{self.pkg_name}=={self.version_found}`, while"
+            f" `{self.pkg_name}{self.version_required}` is required."
+        )
+        if appendix:
+            msg = msg + "\n" + appendix
+        return msg
 
 
 class SystemConfigurationException(DltException):

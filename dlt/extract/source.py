@@ -1,18 +1,27 @@
-import warnings
 import contextlib
 from copy import copy
+from importlib import import_module
 import makefun
 import inspect
-from typing import Dict, Iterable, Iterator, List, Sequence, Tuple, Any
-from typing_extensions import Self
+from typing import Dict, Iterable, Iterator, List, Sequence, Tuple, Any, Generic
+from typing_extensions import Self, Protocol, TypeVar
+from types import ModuleType
+from typing import Dict, Type, ClassVar
 
+from dlt.common import logger
 from dlt.common.configuration.resolve import inject_section
-from dlt.common.configuration.specs import known_sections
+from dlt.common.configuration.specs import BaseConfiguration, known_sections
 from dlt.common.configuration.specs.config_section_context import ConfigSectionContext
+from dlt.common.configuration.specs.pluggable_run_context import (
+    PluggableRunContext,
+    SupportsRunContext,
+)
 from dlt.common.normalizers.json.relational import DataItemNormalizer as RelationalNormalizer
+from dlt.common.runtime.run_context import RunContext
 from dlt.common.schema import Schema
 from dlt.common.schema.typing import TColumnName, TSchemaContract
-from dlt.common.typing import StrAny, TDataItem
+from dlt.common.schema.utils import normalize_table_identifiers
+from dlt.common.typing import StrAny, TDataItem, ParamSpec
 from dlt.common.configuration.container import Container
 from dlt.common.pipeline import (
     PipelineContext,
@@ -22,17 +31,19 @@ from dlt.common.pipeline import (
     pipeline_state,
 )
 from dlt.common.utils import graph_find_scc_nodes, flatten_list_or_items, graph_edges_to_nodes
+from dlt.common.exceptions import MissingDependencyException
 
 from dlt.extract.items import TDecompositionStrategy
 from dlt.extract.pipe_iterator import ManagedPipeIterator
 from dlt.extract.pipe import Pipe
-from dlt.extract.hints import DltResourceHints, make_hints
+from dlt.extract.hints import make_hints
 from dlt.extract.resource import DltResource
 from dlt.extract.exceptions import (
     DataItemRequiredForDynamicTableHints,
     ResourcesNotFoundError,
     DeletingResourcesNotSupported,
     InvalidParallelResourceDataType,
+    UnknownSourceReference,
 )
 
 
@@ -104,7 +115,7 @@ class DltResourceDict(Dict[str, DltResource]):
         return [r._pipe for r in self.values() if r.selected]
 
     def select(self, *resource_names: str) -> Dict[str, DltResource]:
-        # checks if keys are present
+        """Selects `resource_name` to be extracted, and unselects remaining resources."""
         for name in resource_names:
             if name not in self:
                 # if any key is missing, display the full info
@@ -129,6 +140,14 @@ class DltResourceDict(Dict[str, DltResource]):
         finally:
             self._suppress_clone_on_setitem = False
         self._clone_new_pipes([r.name for r in resources])
+
+    def detach(self, resource_name: str = None) -> DltResource:
+        """Clones `resource_name` (including parent resource pipes) and removes source contexts.
+        Defaults to the first resource in the source if `resource_name` is None.
+        """
+        return (self[resource_name] if resource_name else list(self.values())[0])._clone(
+            with_parent=True
+        )
 
     def _clone_new_pipes(self, resource_names: Sequence[str]) -> None:
         # clone all new pipes and keep
@@ -179,6 +198,7 @@ class DltSource(Iterable[TDataItem]):
     * You can select and deselect resources that you want to load via `with_resources` method
     * You can access the resources (which are `DltResource` instances) as source attributes
     * It implements `Iterable` interface so you can get all the data from the resources yourself and without dlt pipeline present.
+    * It will create a DAG from resources and transformers and optimize the extraction so parent resources are extracted only once
     * You can get the `schema` for the source and all the resources within it.
     * You can use a `run` method to load the data with a default instance of dlt pipeline.
     * You can get source read only state for the currently active Pipeline instance
@@ -214,7 +234,7 @@ class DltSource(Iterable[TDataItem]):
     def name(self) -> str:
         return self._schema.name
 
-    # TODO: 4 properties below must go somewhere else ie. into RelationalSchema which is Schema + Relational normalizer.
+    # TODO: max_table_nesting/root_key below must go somewhere else ie. into RelationalSchema which is Schema + Relational normalizer.
     @property
     def max_table_nesting(self) -> int:
         """A schema hint that sets the maximum depth of nested table above which the remaining nodes are loaded as structs or JSON."""
@@ -222,11 +242,53 @@ class DltSource(Iterable[TDataItem]):
 
     @max_table_nesting.setter
     def max_table_nesting(self, value: int) -> None:
-        RelationalNormalizer.update_normalizer_config(self._schema, {"max_nesting": value})
+        if value is None:
+            # this also check the normalizer type
+            config = RelationalNormalizer.get_normalizer_config(self._schema)
+            config.pop("max_nesting", None)
+        else:
+            RelationalNormalizer.update_normalizer_config(self._schema, {"max_nesting": value})
+
+    @property
+    def root_key(self) -> bool:
+        """Enables merging on all resources by propagating root foreign key to nested tables. This option is most useful if you plan to change write disposition of a resource to disable/enable merge"""
+        # this also check the normalizer type
+        config = RelationalNormalizer.get_normalizer_config(self._schema).get("propagation")
+        data_normalizer = self._schema.data_item_normalizer
+        assert isinstance(data_normalizer, RelationalNormalizer)
+        return (
+            config is not None
+            and "root" in config
+            and data_normalizer.c_dlt_id in config["root"]
+            and config["root"][data_normalizer.c_dlt_id] == data_normalizer.c_dlt_root_id
+        )
+
+    @root_key.setter
+    def root_key(self, value: bool) -> None:
+        # this also check the normalizer type
+        config = RelationalNormalizer.get_normalizer_config(self._schema)
+        data_normalizer = self._schema.data_item_normalizer
+        assert isinstance(data_normalizer, RelationalNormalizer)
+
+        if value is True:
+            RelationalNormalizer.update_normalizer_config(
+                self._schema,
+                {
+                    "propagation": {
+                        "root": {
+                            data_normalizer.c_dlt_id: TColumnName(data_normalizer.c_dlt_root_id)
+                        }
+                    }
+                },
+            )
+        else:
+            if self.root_key:
+                propagation_config = config["propagation"]
+                propagation_config["root"].pop(data_normalizer.c_dlt_id)
 
     @property
     def schema_contract(self) -> TSchemaContract:
-        return self.schema.settings["schema_contract"]
+        return self.schema.settings.get("schema_contract")
 
     @schema_contract.setter
     def schema_contract(self, settings: TSchemaContract) -> None:
@@ -234,37 +296,13 @@ class DltSource(Iterable[TDataItem]):
 
     @property
     def exhausted(self) -> bool:
-        """check all selected pipes wether one of them has started. if so, the source is exhausted."""
+        """Check all selected pipes whether one of them has started. if so, the source is exhausted."""
         for resource in self._resources.extracted.values():
             item = resource._pipe.gen
             if inspect.isgenerator(item):
                 if inspect.getgeneratorstate(item) != "GEN_CREATED":
                     return True
         return False
-
-    @property
-    def root_key(self) -> bool:
-        """Enables merging on all resources by propagating root foreign key to child tables. This option is most useful if you plan to change write disposition of a resource to disable/enable merge"""
-        config = RelationalNormalizer.get_normalizer_config(self._schema).get("propagation")
-        return (
-            config is not None
-            and "root" in config
-            and "_dlt_id" in config["root"]
-            and config["root"]["_dlt_id"] == "_dlt_root_id"
-        )
-
-    @root_key.setter
-    def root_key(self, value: bool) -> None:
-        if value is True:
-            RelationalNormalizer.update_normalizer_config(
-                self._schema, {"propagation": {"root": {"_dlt_id": TColumnName("_dlt_root_id")}}}
-            )
-        else:
-            if self.root_key:
-                propagation_config = RelationalNormalizer.get_normalizer_config(self._schema)[
-                    "propagation"
-                ]
-                propagation_config["root"].pop("_dlt_id")  # type: ignore
 
     @property
     def resources(self) -> DltResourceDict:
@@ -291,8 +329,8 @@ class DltSource(Iterable[TDataItem]):
         for r in self.selected_resources.values():
             # names must be normalized here
             with contextlib.suppress(DataItemRequiredForDynamicTableHints):
-                partial_table = self._schema.normalize_table_identifiers(
-                    r.compute_table_schema(item)
+                partial_table = normalize_table_identifiers(
+                    r.compute_table_schema(item), self._schema.naming
                 )
                 schema.update_table(partial_table)
         return schema
@@ -325,6 +363,10 @@ class DltSource(Iterable[TDataItem]):
 
         This is useful for testing, debugging and generating sample datasets for experimentation. You can easily get your test dataset in a few minutes, when otherwise
         you'd need to wait hours for the full loading to complete.
+
+        Notes:
+            1. Transformers resources won't be limited. They should process all the data they receive fully to avoid inconsistencies in generated datasets.
+            2. Each yielded item may contain several records. `add_limit` only limits the "number of yields", not the total number of records.
 
         Args:
             max_items (int): The maximum number of items to yield
@@ -440,3 +482,132 @@ class DltSource(Iterable[TDataItem]):
         info += " Note that, like any iterator, you can iterate the source only once."
         info += f"\ninstance id: {id(self)}"
         return info
+
+
+TDltSourceImpl = TypeVar("TDltSourceImpl", bound=DltSource, default=DltSource)
+TSourceFunParams = ParamSpec("TSourceFunParams")
+
+
+class SourceFactory(Protocol, Generic[TSourceFunParams, TDltSourceImpl]):
+    def __call__(
+        self, *args: TSourceFunParams.args, **kwargs: TSourceFunParams.kwargs
+    ) -> TDltSourceImpl:
+        """Makes dlt source"""
+        pass
+
+    def with_args(
+        self,
+        *,
+        name: str = None,
+        section: str = None,
+        max_table_nesting: int = None,
+        root_key: bool = False,
+        schema: Schema = None,
+        schema_contract: TSchemaContract = None,
+        spec: Type[BaseConfiguration] = None,
+        parallelized: bool = None,
+        _impl_cls: Type[TDltSourceImpl] = None,
+    ) -> Self:
+        """Overrides default decorator arguments that will be used to when DltSource instance and returns modified clone."""
+
+
+class SourceReference:
+    """Runtime information on the source/resource"""
+
+    SOURCES: ClassVar[Dict[str, "SourceReference"]] = {}
+    """A registry of all the decorated sources and resources discovered when importing modules"""
+
+    SPEC: Type[BaseConfiguration]
+    f: SourceFactory[Any, DltSource]
+    module: ModuleType
+    section: str
+    name: str
+    context: SupportsRunContext
+
+    def __init__(
+        self,
+        SPEC: Type[BaseConfiguration],
+        f: SourceFactory[Any, DltSource],
+        module: ModuleType,
+        section: str,
+        name: str,
+    ) -> None:
+        self.SPEC = SPEC
+        self.f = f
+        self.module = module
+        self.section = section
+        self.name = name
+        self.context = Container()[PluggableRunContext].context
+
+    @staticmethod
+    def to_fully_qualified_ref(ref: str) -> List[str]:
+        """Converts ref into fully qualified form, return one or more alternatives for shorthand notations.
+        Run context is injected in needed.
+        """
+        ref_split = ref.split(".")
+        if len(ref_split) > 3:
+            return []
+        # fully qualified path
+        if len(ref_split) == 3:
+            return [ref]
+        # context name is needed
+        refs = []
+        run_names = [Container()[PluggableRunContext].context.name]
+        # always look in default run context
+        if run_names[0] != RunContext.CONTEXT_NAME:
+            run_names.append(RunContext.CONTEXT_NAME)
+        for run_name in run_names:
+            # expand shorthand notation
+            if len(ref_split) == 1:
+                refs.append(f"{run_name}.{ref}.{ref}")
+            else:
+                # for ref with two parts two options are possible
+                refs.extend([f"{run_name}.{ref}", f"{ref_split[0]}.{ref_split[1]}.{ref_split[1]}"])
+        return refs
+
+    @classmethod
+    def register(cls, ref_obj: "SourceReference") -> None:
+        ref = f"{ref_obj.context.name}.{ref_obj.section}.{ref_obj.name}"
+        if ref in cls.SOURCES:
+            logger.warning(f"A source with ref {ref} is already registered and will be overwritten")
+        cls.SOURCES[ref] = ref_obj
+
+    @classmethod
+    def find(cls, ref: str) -> "SourceReference":
+        refs = cls.to_fully_qualified_ref(ref)
+
+        for ref_ in refs:
+            if wrapper := cls.SOURCES.get(ref_):
+                return wrapper
+        raise KeyError(refs)
+
+    @classmethod
+    def from_reference(cls, ref: str) -> SourceFactory[Any, DltSource]:
+        """Returns registered source factory or imports source module and returns a function.
+        Expands shorthand notation into section.name eg. "sql_database" is expanded into "sql_database.sql_database"
+        """
+        refs = cls.to_fully_qualified_ref(ref)
+
+        for ref_ in refs:
+            if wrapper := cls.SOURCES.get(ref_):
+                return wrapper.f
+
+        # try to import module
+        if "." in ref:
+            try:
+                module_path, attr_name = ref.rsplit(".", 1)
+                dest_module = import_module(module_path)
+                factory = getattr(dest_module, attr_name)
+                if hasattr(factory, "with_args"):
+                    return factory  # type: ignore[no-any-return]
+                else:
+                    raise ValueError(f"{attr_name} in {module_path} is of type {type(factory)}")
+            except MissingDependencyException:
+                raise
+            except ModuleNotFoundError:
+                # raise regular exception later
+                pass
+            except Exception as e:
+                raise UnknownSourceReference([ref]) from e
+
+        raise UnknownSourceReference(refs or [ref])

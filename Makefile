@@ -44,7 +44,7 @@ has-poetry:
 	poetry --version
 
 dev: has-poetry
-	poetry install --all-extras --with airflow --with docs --with providers --with pipeline --with sentry-sdk
+	poetry install --all-extras --with docs,providers,pipeline,sources,sentry-sdk,airflow
 
 lint:
 	./tools/check-package.sh
@@ -52,7 +52,7 @@ lint:
 	poetry run mypy --config-file mypy.ini dlt tests
 	poetry run flake8 --max-line-length=200 dlt
 	poetry run flake8 --max-line-length=200 tests --exclude tests/reflection/module_cases
-	poetry run black dlt docs tests --diff --extend-exclude=".*syntax_error.py"
+	poetry run black dlt docs tests --check --diff --color --extend-exclude=".*syntax_error.py"
 	# poetry run isort ./ --diff
 	# $(MAKE) lint-security
 
@@ -67,9 +67,9 @@ lint-and-test-snippets:
 	cd docs/website/docs && poetry run pytest --ignore=node_modules
 
 lint-and-test-examples:
-	poetry run mypy --config-file mypy.ini docs/examples
-	poetry run flake8 --max-line-length=200 docs/examples
 	cd docs/tools && poetry run python prepare_examples_tests.py
+	poetry run flake8 --max-line-length=200 docs/examples
+	poetry run mypy --config-file mypy.ini docs/examples
 	cd docs/examples && poetry run pytest
 
 
@@ -107,4 +107,13 @@ test-build-images: build-library
 	docker build -f deploy/dlt/Dockerfile.airflow --build-arg=COMMIT_SHA="$(shell git log -1 --pretty=%h)" --build-arg=IMAGE_VERSION="$(shell poetry version -s)" .
 	# docker build -f deploy/dlt/Dockerfile --build-arg=COMMIT_SHA="$(shell git log -1 --pretty=%h)" --build-arg=IMAGE_VERSION="$(shell poetry version -s)" .
 
+preprocess-docs:
+	# run docs preprocessing to run a few checks and ensure examples can be parsed
+	cd docs/website && npm i && npm run preprocess-docs
 
+start-test-containers:
+	docker compose -f "tests/load/dremio/docker-compose.yml" up -d
+	docker compose -f "tests/load/postgres/docker-compose.yml" up -d
+	docker compose -f "tests/load/weaviate/docker-compose.yml" up -d
+	docker compose -f "tests/load/filesystem_sftp/docker-compose.yml" up -d
+	docker compose -f "tests/load/sqlalchemy/docker-compose.yml" up -d

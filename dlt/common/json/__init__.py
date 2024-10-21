@@ -12,41 +12,14 @@ try:
 except ImportError:
     PydanticBaseModel = None  # type: ignore[misc]
 
+from dlt.common import known_env
 from dlt.common.pendulum import pendulum
 from dlt.common.arithmetics import Decimal
 from dlt.common.wei import Wei
 from dlt.common.utils import map_nested_in_place
 
 
-class SupportsJson(Protocol):
-    """Minimum adapter for different json parser implementations"""
-
-    _impl_name: str
-    """Implementation name"""
-
-    def dump(
-        self, obj: Any, fp: IO[bytes], sort_keys: bool = False, pretty: bool = False
-    ) -> None: ...
-
-    def typed_dump(self, obj: Any, fp: IO[bytes], pretty: bool = False) -> None: ...
-
-    def typed_dumps(self, obj: Any, sort_keys: bool = False, pretty: bool = False) -> str: ...
-
-    def typed_loads(self, s: str) -> Any: ...
-
-    def typed_dumpb(self, obj: Any, sort_keys: bool = False, pretty: bool = False) -> bytes: ...
-
-    def typed_loadb(self, s: Union[bytes, bytearray, memoryview]) -> Any: ...
-
-    def dumps(self, obj: Any, sort_keys: bool = False, pretty: bool = False) -> str: ...
-
-    def dumpb(self, obj: Any, sort_keys: bool = False, pretty: bool = False) -> bytes: ...
-
-    def load(self, fp: Union[IO[bytes], IO[str]]) -> Any: ...
-
-    def loads(self, s: str) -> Any: ...
-
-    def loadb(self, s: Union[bytes, bytearray, memoryview]) -> Any: ...
+TPuaDecoders = List[Callable[[Any], Any]]
 
 
 def custom_encode(obj: Any) -> str:
@@ -80,7 +53,7 @@ def custom_encode(obj: Any) -> str:
 
 
 # use PUA range to encode additional types
-PUA_START = int(os.environ.get("DLT_JSON_TYPED_PUA_START", "0xf026"), 16)
+PUA_START = int(os.environ.get(known_env.DLT_JSON_TYPED_PUA_START, "0xf026"), 16)
 
 _DECIMAL = chr(PUA_START)
 _DATETIME = chr(PUA_START + 1)
@@ -103,7 +76,7 @@ def _datetime_decoder(obj: str) -> datetime:
 
 
 # define decoder for each prefix
-DECODERS: List[Callable[[Any], Any]] = [
+DECODERS: TPuaDecoders = [
     Decimal,
     _datetime_decoder,
     pendulum.Date.fromisoformat,
@@ -113,6 +86,11 @@ DECODERS: List[Callable[[Any], Any]] = [
     Wei,
     pendulum.Time.fromisoformat,
 ]
+# Alternate decoders that decode date/time/datetime to stdlib types instead of pendulum
+PY_DATETIME_DECODERS = list(DECODERS)
+PY_DATETIME_DECODERS[1] = datetime.fromisoformat
+PY_DATETIME_DECODERS[2] = date.fromisoformat
+PY_DATETIME_DECODERS[7] = time.fromisoformat
 # how many decoders?
 PUA_CHARACTER_MAX = len(DECODERS)
 
@@ -143,20 +121,20 @@ def custom_pua_encode(obj: Any) -> str:
     elif dataclasses.is_dataclass(obj):
         return dataclasses.asdict(obj)  # type: ignore
     elif PydanticBaseModel and isinstance(obj, PydanticBaseModel):
-        return obj.dict()  # type: ignore[return-value]
+        return obj.dict(by_alias=True)  # type: ignore[return-value]
     elif isinstance(obj, Enum):
         # Enum value is just int or str
         return obj.value  # type: ignore[no-any-return]
     raise TypeError(repr(obj) + " is not JSON serializable")
 
 
-def custom_pua_decode(obj: Any) -> Any:
+def custom_pua_decode(obj: Any, decoders: TPuaDecoders = DECODERS) -> Any:
     if isinstance(obj, str) and len(obj) > 1:
         c = ord(obj[0]) - PUA_START
         # decode only the PUA space defined in DECODERS
         if c >= 0 and c <= PUA_CHARACTER_MAX:
             try:
-                return DECODERS[c](obj[1:])
+                return decoders[c](obj[1:])
             except Exception:
                 # return strings that cannot be parsed
                 # this may be due
@@ -166,11 +144,11 @@ def custom_pua_decode(obj: Any) -> Any:
     return obj
 
 
-def custom_pua_decode_nested(obj: Any) -> Any:
+def custom_pua_decode_nested(obj: Any, decoders: TPuaDecoders = DECODERS) -> Any:
     if isinstance(obj, str):
-        return custom_pua_decode(obj)
+        return custom_pua_decode(obj, decoders)
     elif isinstance(obj, (list, dict)):
-        return map_nested_in_place(custom_pua_decode, obj)
+        return map_nested_in_place(custom_pua_decode, obj, decoders=decoders)
     return obj
 
 
@@ -189,9 +167,42 @@ def may_have_pua(line: bytes) -> bool:
     return PUA_START_UTF8_MAGIC in line
 
 
+class SupportsJson(Protocol):
+    """Minimum adapter for different json parser implementations"""
+
+    _impl_name: str
+    """Implementation name"""
+
+    def dump(
+        self, obj: Any, fp: IO[bytes], sort_keys: bool = False, pretty: bool = False
+    ) -> None: ...
+
+    def typed_dump(self, obj: Any, fp: IO[bytes], pretty: bool = False) -> None: ...
+
+    def typed_dumps(self, obj: Any, sort_keys: bool = False, pretty: bool = False) -> str: ...
+
+    def typed_loads(self, s: str) -> Any: ...
+
+    def typed_dumpb(self, obj: Any, sort_keys: bool = False, pretty: bool = False) -> bytes: ...
+
+    def typed_loadb(
+        self, s: Union[bytes, bytearray, memoryview], decoders: TPuaDecoders = DECODERS
+    ) -> Any: ...
+
+    def dumps(self, obj: Any, sort_keys: bool = False, pretty: bool = False) -> str: ...
+
+    def dumpb(self, obj: Any, sort_keys: bool = False, pretty: bool = False) -> bytes: ...
+
+    def load(self, fp: Union[IO[bytes], IO[str]]) -> Any: ...
+
+    def loads(self, s: str) -> Any: ...
+
+    def loadb(self, s: Union[bytes, bytearray, memoryview]) -> Any: ...
+
+
 # pick the right impl
 json: SupportsJson = None
-if os.environ.get("DLT_USE_JSON") == "simplejson":
+if os.environ.get(known_env.DLT_USE_JSON) == "simplejson":
     from dlt.common.json import _simplejson as _json_d
 
     json = _json_d  # type: ignore[assignment]
@@ -215,4 +226,7 @@ __all__ = [
     "custom_pua_remove",
     "SupportsJson",
     "may_have_pua",
+    "TPuaDecoders",
+    "DECODERS",
+    "PY_DATETIME_DECODERS",
 ]

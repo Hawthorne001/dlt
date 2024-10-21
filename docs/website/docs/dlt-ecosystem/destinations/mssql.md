@@ -9,7 +9,7 @@ keywords: [mssql, sqlserver, destination, data warehouse]
 ## Install dlt with MS SQL
 **To install the dlt library with MS SQL dependencies, use:**
 ```sh
-pip install dlt[mssql]
+pip install "dlt[mssql]"
 ```
 
 ## Setup guide
@@ -17,7 +17,7 @@ pip install dlt[mssql]
 ### Prerequisites
 
 The _Microsoft ODBC Driver for SQL Server_ must be installed to use this destination.
-This cannot be included with `dlt`'s python dependencies, so you must install it separately on your system. You can find the official installation instructions [here](https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server?view=sql-server-ver16).
+This cannot be included with `dlt`'s Python dependencies, so you must install it separately on your system. You can find the official installation instructions [here](https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server?view=sql-server-ver16).
 
 Supported driver versions:
 * `ODBC Driver 18 for SQL Server`
@@ -38,7 +38,7 @@ pip install -r requirements.txt
 ```
 or run:
 ```sh
-pip install dlt[mssql]
+pip install "dlt[mssql]"
 ```
 This will install `dlt` with the `mssql` extra, which contains all the dependencies required by the SQL server client.
 
@@ -53,31 +53,57 @@ password = "<password>"
 host = "loader.database.windows.net"
 port = 1433
 connect_timeout = 15
+[destination.mssql.credentials.query]
+# trust self-signed SSL certificates
+TrustServerCertificate="yes"
+# require SSL connection
+Encrypt="yes"
+# send large string as VARCHAR, not legacy TEXT
+LongAsMax="yes"
 ```
 
 You can also pass a SQLAlchemy-like database connection:
 ```toml
-# keep it at the top of your toml file! before any section starts
-destination.mssql.credentials="mssql://loader:<password>@loader.database.windows.net/dlt_data?connect_timeout=15"
+# Keep it at the top of your TOML file, before any section starts
+destination.mssql.credentials="mssql://loader:<password>@loader.database.windows.net/dlt_data?TrustServerCertificate=yes&Encrypt=yes&LongAsMax=yes"
 ```
 
-To connect to an `mssql` server using Windows authentication, include `trusted_connection=yes` in the connection string. This method is useful when SQL logins aren't available, and you use Windows credentials.
+You can place any ODBC-specific settings into the query string or **destination.mssql.credentials.query** TOML table as in the example above.
+
+**To connect to an `mssql` server using Windows authentication**, include `trusted_connection=yes` in the connection string.
 
 ```toml
-destination.mssql.credentials="mssql://username:password@loader.database.windows.net/dlt_data?trusted_connection=yes"
+destination.mssql.credentials="mssql://loader.database.windows.net/dlt_data?trusted_connection=yes"
 ```
-> The username and password must be filled out with the appropriate login credentials or left untouched. Leaving these empty is not recommended.
 
-To pass credentials directly, you can use the `credentials` argument passed to `dlt.pipeline` or `pipeline.run` methods.
+**To connect to a local SQL server instance running without SSL**, pass the `encrypt=no` parameter:
+```toml
+destination.mssql.credentials="mssql://loader:loader@localhost/dlt_data?encrypt=no"
+```
+
+**To allow a self-signed SSL certificate** when you are getting `certificate verify failed: unable to get local issuer certificate`:
+```toml
+destination.mssql.credentials="mssql://loader:loader@localhost/dlt_data?TrustServerCertificate=yes"
+```
+
+**To use long strings (>8k) and avoid collation errors**:
+```toml
+destination.mssql.credentials="mssql://loader:loader@localhost/dlt_data?LongAsMax=yes"
+```
+
+**To pass credentials directly**, use the [explicit instance of the destination](../../general-usage/destination.md#pass-explicit-credentials)
 ```py
-pipeline = dlt.pipeline(pipeline_name='chess', destination='postgres', dataset_name='chess_data', credentials="mssql://loader:<password>@loader.database.windows.net/dlt_data?connect_timeout=15")
+pipeline = dlt.pipeline(
+  pipeline_name='chess',
+  destination=dlt.destinations.mssql("mssql://loader:<password>@loader.database.windows.net/dlt_data?connect_timeout=15"),
+  dataset_name='chess_data')
 ```
 
 ## Write disposition
 All write dispositions are supported.
 
 If you set the [`replace` strategy](../../general-usage/full-loading.md) to `staging-optimized`, the destination tables will be dropped and
-recreated with an `ALTER SCHEMA ... TRANSFER`. The operation is atomic: mssql supports DDL transactions.
+recreated with an `ALTER SCHEMA ... TRANSFER`. The operation is atomic: MSSQL supports DDL transactions.
 
 ## Data loading
 Data is loaded via INSERT statements by default. MSSQL has a limit of 1000 rows per INSERT, and this is what we use.
@@ -87,6 +113,15 @@ Data is loaded via INSERT statements by default. MSSQL has a limit of 1000 rows 
 
 ## Supported column hints
 **mssql** will create unique indexes for all columns with `unique` hints. This behavior **may be disabled**.
+
+### Table and column identifiers
+SQL Server **with the default collation** uses case-insensitive identifiers but will preserve the casing of identifiers that are stored in the INFORMATION SCHEMA. You can use [case-sensitive naming conventions](../../general-usage/naming-convention.md#case-sensitive-and-insensitive-destinations) to keep the identifier casing. Note that you risk generating identifier collisions, which are detected by `dlt` and will fail the load process.
+
+If you change the SQL Server server/database collation to case-sensitive, this will also affect the identifiers. Configure your destination as below in order to use case-sensitive naming conventions without collisions:
+```toml
+[destination.mssql]
+has_case_sensitive_identifiers=true
+```
 
 ## Syncing of `dlt` state
 This destination fully supports [dlt state sync](../../general-usage/state#syncing-state-with-destination).
@@ -110,12 +145,12 @@ driver="ODBC Driver 18 for SQL Server"
 When using a SQLAlchemy connection string, replace spaces with `+`:
 
 ```toml
-# keep it at the top of your toml file! before any section starts
+# Keep it at the top of your TOML file, before any section starts
 destination.mssql.credentials="mssql://loader:<password>@loader.database.windows.net/dlt_data?driver=ODBC+Driver+18+for+SQL+Server"
 ```
 
 ### dbt support
-No dbt support yet.
+This destination [integrates with dbt](../transformations/dbt/dbt.md) via [dbt-snowflake](https://github.com/dbt-msft/dbt-sqlserver).
 
 <!--@@@DLT_TUBA mssql-->
 

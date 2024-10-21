@@ -3,10 +3,9 @@ import os
 import re
 import stat
 import errno
-import tempfile
 import shutil
 import pathvalidate
-from typing import IO, Any, Optional, List, cast, overload
+from typing import IO, Any, Optional, List, cast
 from dlt.common.typing import AnyFun
 
 from dlt.common.utils import encoding_for_mode, uniq_id
@@ -18,7 +17,7 @@ FILE_COMPONENT_INVALID_CHARACTERS = re.compile(r"[.%{}]")
 class FileStorage:
     def __init__(self, storage_path: str, file_type: str = "t", makedirs: bool = False) -> None:
         # make it absolute path
-        self.storage_path = os.path.realpath(storage_path)  # os.path.join(, '')
+        self.storage_path = os.path.realpath(storage_path)
         self.file_type = file_type
         if makedirs:
             os.makedirs(storage_path, exist_ok=True)
@@ -29,10 +28,8 @@ class FileStorage:
     @staticmethod
     def save_atomic(storage_path: str, relative_path: str, data: Any, file_type: str = "t") -> str:
         mode = "w" + file_type
-        with tempfile.NamedTemporaryFile(
-            dir=storage_path, mode=mode, delete=False, encoding=encoding_for_mode(mode)
-        ) as f:
-            tmp_path = f.name
+        tmp_path = os.path.join(storage_path, uniq_id(8))
+        with open(tmp_path, mode=mode, encoding=encoding_for_mode(mode)) as f:
             f.write(data)
         try:
             dest_path = os.path.join(storage_path, relative_path)
@@ -116,11 +113,11 @@ class FileStorage:
             return FileStorage.open_zipsafe_ro(self.make_full_path(relative_path), mode)
         return open(self.make_full_path(relative_path), mode, encoding=encoding_for_mode(mode))
 
-    def open_temp(self, delete: bool = False, mode: str = "w", file_type: str = None) -> IO[Any]:
-        mode = mode + file_type or self.file_type
-        return tempfile.NamedTemporaryFile(
-            dir=self.storage_path, mode=mode, delete=delete, encoding=encoding_for_mode(mode)
-        )
+    # def open_temp(self, delete: bool = False, mode: str = "w", file_type: str = None) -> IO[Any]:
+    #     mode = mode + file_type or self.file_type
+    #     return tempfile.NamedTemporaryFile(
+    #         dir=self.storage_path, mode=mode, delete=delete, encoding=encoding_for_mode(mode)
+    #     )
 
     def has_file(self, relative_path: str) -> bool:
         return os.path.isfile(self.make_full_path(relative_path))
@@ -172,12 +169,9 @@ class FileStorage:
         """Try to create a hardlink and fallback to copying when filesystem doesn't support links"""
         try:
             os.link(external_file_path, to_file_path)
-        except OSError as ex:
+        except OSError:
             # Fallback to copy when fs doesn't support links or attempting to make a cross-device link
-            if ex.errno in (errno.EPERM, errno.EXDEV, errno.EMLINK):
-                FileStorage.copy_atomic_to_file(external_file_path, to_file_path)
-            else:
-                raise
+            FileStorage.copy_atomic_to_file(external_file_path, to_file_path)
 
     def atomic_rename(self, from_relative_path: str, to_relative_path: str) -> None:
         """Renames a path using os.rename which is atomic on POSIX, Windows and NFS v4.
@@ -246,7 +240,8 @@ class FileStorage:
             FileStorage.move_atomic_to_file(external_file_path, dest_file_path)
         )
 
-    def in_storage(self, path: str) -> bool:
+    def is_path_in_storage(self, path: str) -> bool:
+        """Checks if a given path is below storage root, without checking for item existence"""
         assert path is not None
         # all paths are relative to root
         if not os.path.isabs(path):
@@ -259,25 +254,30 @@ class FileStorage:
     def to_relative_path(self, path: str) -> str:
         if path == "":
             return ""
-        if not self.in_storage(path):
+        if not self.is_path_in_storage(path):
             raise ValueError(path)
         if not os.path.isabs(path):
             path = os.path.realpath(os.path.join(self.storage_path, path))
         # for abs paths find the relative
         return os.path.relpath(path, start=self.storage_path)
 
-    def make_full_path(self, path: str) -> str:
+    def make_full_path_safe(self, path: str) -> str:
+        """Verifies that path is under storage root and then returns normalized absolute path"""
         # try to make a relative path if paths are absolute or overlapping
         path = self.to_relative_path(path)
         # then assume that it is a path relative to storage root
         return os.path.realpath(os.path.join(self.storage_path, path))
+
+    def make_full_path(self, path: str) -> str:
+        """Joins path with storage root. Intended for path known to be relative to storage root"""
+        return os.path.join(self.storage_path, path)
 
     def from_wd_to_relative_path(self, wd_relative_path: str) -> str:
         path = os.path.realpath(wd_relative_path)
         return self.to_relative_path(path)
 
     def from_relative_path_to_wd(self, relative_path: str) -> str:
-        return os.path.relpath(self.make_full_path(relative_path), start=".")
+        return os.path.relpath(self.make_full_path_safe(relative_path), start=".")
 
     @staticmethod
     def get_file_name_from_file_path(file_path: str) -> str:

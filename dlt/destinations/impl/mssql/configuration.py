@@ -1,11 +1,10 @@
 import dataclasses
 from typing import Final, ClassVar, Any, List, Dict
-from dlt.common.libs.sql_alchemy import URL
 
 from dlt.common.configuration import configspec
 from dlt.common.configuration.specs import ConnectionStringCredentials
 from dlt.common.utils import digest128
-from dlt.common.typing import TSecretValue
+from dlt.common.typing import TSecretStrValue
 from dlt.common.exceptions import SystemConfigurationException
 
 from dlt.common.destination.reference import DestinationClientDwhWithStagingConfiguration
@@ -14,7 +13,9 @@ from dlt.common.destination.reference import DestinationClientDwhWithStagingConf
 @configspec(init=False)
 class MsSqlCredentials(ConnectionStringCredentials):
     drivername: Final[str] = dataclasses.field(default="mssql", init=False, repr=False, compare=False)  # type: ignore
-    password: TSecretValue = None
+    database: str = None
+    username: str = None
+    password: TSecretStrValue = None
     host: str = None
     port: int = 1433
     connect_timeout: int = 15
@@ -34,8 +35,6 @@ class MsSqlCredentials(ConnectionStringCredentials):
             self.query = {k.lower(): v for k, v in self.query.items()}  # Make case-insensitive.
         self.driver = self.query.get("driver", self.driver)
         self.connect_timeout = int(self.query.get("connect_timeout", self.connect_timeout))
-        if not self.is_partial():
-            self.resolve()
 
     def on_resolved(self) -> None:
         if self.driver not in self.SUPPORTED_DRIVERS:
@@ -45,10 +44,10 @@ class MsSqlCredentials(ConnectionStringCredentials):
             )
         self.database = self.database.lower()
 
-    def to_url(self) -> URL:
-        url = super().to_url()
-        url.update_query_pairs([("connect_timeout", str(self.connect_timeout))])
-        return url
+    def get_query(self) -> Dict[str, Any]:
+        query = dict(super().get_query())
+        query["connect_timeout"] = self.connect_timeout
+        return query
 
     def on_partial(self) -> None:
         self.driver = self._get_driver()
@@ -95,6 +94,7 @@ class MsSqlClientConfiguration(DestinationClientDwhWithStagingConfiguration):
     credentials: MsSqlCredentials = None
 
     create_indexes: bool = False
+    has_case_sensitive_identifiers: bool = False
 
     def fingerprint(self) -> str:
         """Returns a fingerprint of host part of a connection string"""

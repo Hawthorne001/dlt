@@ -12,9 +12,7 @@ from tests.load.utils import DestinationTestConfiguration, destinations_configs
     ids=lambda x: x.name,
 )
 def test_dremio(destination_config: DestinationTestConfiguration) -> None:
-    pipeline = destination_config.setup_pipeline(
-        "dremio-test", dataset_name="bar", full_refresh=True
-    )
+    pipeline = destination_config.setup_pipeline("dremio-test", dataset_name="bar", dev_mode=True)
 
     @dlt.resource(name="items", write_disposition="replace")
     def items() -> Iterator[Any]:
@@ -24,7 +22,7 @@ def test_dremio(destination_config: DestinationTestConfiguration) -> None:
             "sub_items": [{"id": 101, "name": "sub item 101"}, {"id": 101, "name": "sub item 102"}],
         }
 
-    print(pipeline.run([items]))
+    print(pipeline.run([items], **destination_config.run_kwargs))
 
     table_counts = load_table_counts(
         pipeline, *[t["name"] for t in pipeline.default_schema._schema_tables.values()]

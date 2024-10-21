@@ -1,14 +1,17 @@
 import gzip
 import time
-from typing import ClassVar, List, IO, Any, Optional, Type, Generic
+import contextlib
+from typing import ClassVar, Iterator, List, IO, Any, Optional, Type, Generic
 
+from dlt.common.metrics import DataWriterMetrics
 from dlt.common.typing import TDataItem, TDataItems
 from dlt.common.data_writers.exceptions import (
     BufferedDataWriterClosed,
     DestinationCapabilitiesRequired,
+    FileImportNotFound,
     InvalidFileNameTemplateException,
 )
-from dlt.common.data_writers.writers import TWriter, DataWriter, DataWriterMetrics, FileWriterSpec
+from dlt.common.data_writers.writers import TWriter, DataWriter, FileWriterSpec
 from dlt.common.schema.typing import TTableSchemaColumns
 from dlt.common.configuration import with_config, known_sections, configspec
 from dlt.common.configuration.specs import BaseConfiguration
@@ -42,7 +45,7 @@ class BufferedDataWriter(Generic[TWriter]):
         file_max_items: int = None,
         file_max_bytes: int = None,
         disable_compression: bool = False,
-        _caps: DestinationCapabilitiesContext = None
+        _caps: DestinationCapabilitiesContext = None,
     ):
         self.writer_spec = writer_spec
         if self.writer_spec.requires_destination_capabilities and not _caps:
@@ -55,7 +58,10 @@ class BufferedDataWriter(Generic[TWriter]):
         self.closed_files: List[DataWriterMetrics] = []  # all fully processed files
         # buffered items must be less than max items in file
         self.buffer_max_items = min(buffer_max_items, file_max_items or buffer_max_items)
+        # Explicitly configured max size supersedes destination limit
         self.file_max_bytes = file_max_bytes
+        if self.file_max_bytes is None and _caps:
+            self.file_max_bytes = _caps.recommended_file_size
         self.file_max_items = file_max_items
         # the open function is either gzip.open or open
         self.open = (
@@ -93,29 +99,17 @@ class BufferedDataWriter(Generic[TWriter]):
         # until the first chunk is written we can change the columns schema freely
         if columns is not None:
             self._current_columns = dict(columns)
-
-        new_rows_count: int
-        if isinstance(item, List):
-            # items coming in single list will be written together, not matter how many are there
-            self._buffered_items.extend(item)
-            # update row count, if item supports "num_rows" it will be used to count items
-            if len(item) > 0 and hasattr(item[0], "num_rows"):
-                new_rows_count = sum(tbl.num_rows for tbl in item)
-            else:
-                new_rows_count = len(item)
-        else:
-            self._buffered_items.append(item)
-            # update row count, if item supports "num_rows" it will be used to count items
-            if hasattr(item, "num_rows"):
-                new_rows_count = item.num_rows
-            else:
-                new_rows_count = 1
+        # add item to buffer and count new rows
+        new_rows_count = self._buffer_items_with_row_count(item)
         self._buffered_items_count += new_rows_count
-        # flush if max buffer exceeded
-        if self._buffered_items_count >= self.buffer_max_items:
-            self._flush_items()
         # set last modification date
         self._last_modified = time.time()
+        # flush if max buffer exceeded, the second path of the expression prevents empty data frames to pile up in the buffer
+        if (
+            self._buffered_items_count >= self.buffer_max_items
+            or len(self._buffered_items) >= self.buffer_max_items
+        ):
+            self._flush_items()
         # rotate the file if max_bytes exceeded
         if self._file:
             # rotate on max file size
@@ -135,18 +129,31 @@ class BufferedDataWriter(Generic[TWriter]):
         self._last_modified = time.time()
         return self._rotate_file(allow_empty_file=True)
 
-    def import_file(self, file_path: str, metrics: DataWriterMetrics) -> DataWriterMetrics:
+    def import_file(
+        self, file_path: str, metrics: DataWriterMetrics, with_extension: str = None
+    ) -> DataWriterMetrics:
         """Import a file from `file_path` into items storage under a new file name. Does not check
         the imported file format. Uses counts from `metrics` as a base. Logically closes the imported file
 
         The preferred import method is a hard link to avoid copying the data. If current filesystem does not
         support it, a regular copy is used.
+
+        Alternative extension may be provided via `with_extension` so various file formats may be imported into the same folder.
         """
         # TODO: we should separate file storage from other storages. this creates circular deps
         from dlt.common.storages import FileStorage
 
-        self._rotate_file()
-        FileStorage.link_hard_with_fallback(file_path, self._file_name)
+        # import file with alternative extension
+        spec = self.writer_spec
+        if with_extension:
+            spec = self.writer_spec._replace(file_extension=with_extension)
+        with self.alternative_spec(spec):
+            self._rotate_file()
+        try:
+            FileStorage.link_hard_with_fallback(file_path, self._file_name)
+        except FileNotFoundError as f_ex:
+            raise FileImportNotFound(file_path, self._file_name) from f_ex
+
         self._last_modified = time.time()
         metrics = metrics._replace(
             file_path=self._file_name,
@@ -173,6 +180,16 @@ class BufferedDataWriter(Generic[TWriter]):
     def closed(self) -> bool:
         return self._closed
 
+    @contextlib.contextmanager
+    def alternative_spec(self, spec: FileWriterSpec) -> Iterator[FileWriterSpec]:
+        """Temporarily changes the writer spec ie. for the moment file is rotated"""
+        old_spec = self.writer_spec
+        try:
+            self.writer_spec = spec
+            yield spec
+        finally:
+            self.writer_spec = old_spec
+
     def __enter__(self) -> "BufferedDataWriter[TWriter]":
         return self
 
@@ -188,6 +205,26 @@ class BufferedDataWriter(Generic[TWriter]):
             # raise the on close exception if we are not handling another exception
             if not in_exception:
                 raise
+
+    def _buffer_items_with_row_count(self, item: TDataItems) -> int:
+        """Adds `item` to in-memory buffer and counts new rows, depending in item type"""
+        new_rows_count: int
+        if isinstance(item, List):
+            # update row count, if item supports "num_rows" it will be used to count items
+            if len(item) > 0 and hasattr(item[0], "num_rows"):
+                new_rows_count = sum(tbl.num_rows for tbl in item)
+            else:
+                new_rows_count = len(item)
+            # items coming in a single list will be written together, no matter how many there are
+            self._buffered_items.extend(item)
+        else:
+            self._buffered_items.append(item)
+            # update row count, if item supports "num_rows" it will be used to count items
+            if hasattr(item, "num_rows"):
+                new_rows_count = item.num_rows
+            else:
+                new_rows_count = 1
+        return new_rows_count
 
     def _rotate_file(self, allow_empty_file: bool = False) -> DataWriterMetrics:
         metrics = self._flush_and_close_file(allow_empty_file)

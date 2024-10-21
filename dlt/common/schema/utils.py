@@ -1,12 +1,14 @@
 import re
 import base64
 import hashlib
+import warnings
 import yaml
 from copy import deepcopy, copy
 from typing import Dict, List, Sequence, Tuple, Type, Any, cast, Iterable, Optional, Union
 
 from dlt.common.pendulum import pendulum
 from dlt.common.time import ensure_pendulum_datetime
+from dlt.common import logger
 from dlt.common.json import json
 from dlt.common.data_types import TDataType
 from dlt.common.exceptions import DictValidationException
@@ -16,29 +18,35 @@ from dlt.common.typing import DictStrAny, REPattern
 from dlt.common.validation import TCustomValidator, validate_dict_ignoring_xkeys
 from dlt.common.schema import detections
 from dlt.common.schema.typing import (
-    COLUMN_HINTS,
+    C_DLT_ID,
     SCHEMA_ENGINE_VERSION,
     LOADS_TABLE_NAME,
     SIMPLE_REGEX_PREFIX,
     VERSION_TABLE_NAME,
+    PIPELINE_STATE_TABLE_NAME,
+    ColumnPropInfos,
     TColumnName,
+    TFileFormat,
     TPartialTableSchema,
     TSchemaTables,
     TSchemaUpdate,
     TSimpleRegex,
     TStoredSchema,
+    TTableProcessingHints,
     TTableSchema,
     TColumnSchemaBase,
     TColumnSchema,
     TColumnProp,
     TTableFormat,
-    TColumnHint,
+    TColumnDefaultHint,
+    TTableSchemaColumns,
     TTypeDetectionFunc,
     TTypeDetections,
     TWriteDisposition,
     TLoaderMergeStrategy,
     TSchemaContract,
     TSortOrder,
+    TTableReference,
 )
 from dlt.common.schema.exceptions import (
     CannotCoerceColumnException,
@@ -46,11 +54,11 @@ from dlt.common.schema.exceptions import (
     TablePropertiesConflictException,
     InvalidSchemaName,
 )
+from dlt.common.warnings import Dlt100DeprecationWarning
 
 
 RE_NON_ALPHANUMERIC_UNDERSCORE = re.compile(r"[^a-zA-Z\d_]")
 DEFAULT_WRITE_DISPOSITION: TWriteDisposition = "append"
-DEFAULT_MERGE_STRATEGY: TLoaderMergeStrategy = "delete-insert"
 
 
 def is_valid_schema_name(name: str) -> bool:
@@ -60,6 +68,12 @@ def is_valid_schema_name(name: str) -> bool:
         and name.isidentifier()
         and len(name) <= InvalidSchemaName.MAXIMUM_SCHEMA_NAME_LENGTH
     )
+
+
+def is_nested_table(table: TTableSchema) -> bool:
+    """Checks if table is a dlt nested table: connected to parent table via row_key - parent_key reference"""
+    # "parent" table hint indicates NESTED table.
+    return bool(table.get("parent"))
 
 
 def normalize_schema_name(name: str) -> str:
@@ -76,12 +90,6 @@ def apply_defaults(stored_schema: TStoredSchema) -> TStoredSchema:
     for table_name, table in stored_schema["tables"].items():
         # overwrite name
         table["name"] = table_name
-        # add default write disposition to root tables
-        if table.get("parent") is None:
-            if table.get("write_disposition") is None:
-                table["write_disposition"] = DEFAULT_WRITE_DISPOSITION
-            if table.get("resource") is None:
-                table["resource"] = table_name
         for column_name in table["columns"]:
             # add default hints to tables
             column = table["columns"][column_name]
@@ -89,20 +97,27 @@ def apply_defaults(stored_schema: TStoredSchema) -> TStoredSchema:
             column["name"] = column_name
             # set column with default
             # table["columns"][column_name] = column
+        # add default write disposition to root tables
+        if not is_nested_table(table):
+            if table.get("write_disposition") is None:
+                table["write_disposition"] = DEFAULT_WRITE_DISPOSITION
+            if table.get("resource") is None:
+                table["resource"] = table_name
     return stored_schema
 
 
 def remove_defaults(stored_schema: TStoredSchema) -> TStoredSchema:
     """Removes default values from `stored_schema` in place, returns the input for chaining
 
-    Default values are removed from table schemas and complete column schemas. Incomplete columns are preserved intact.
+    * removes column and table names from the value
+    * removed resource name if same as table name
     """
     clean_tables = deepcopy(stored_schema["tables"])
-    for table_name, t in clean_tables.items():
-        del t["name"]
-        if t.get("resource") == table_name:
-            del t["resource"]
-        for c in t["columns"].values():
+    for table in clean_tables.values():
+        del table["name"]
+        # if t.get("resource") == table_name:
+        #     del t["resource"]
+        for c in table["columns"].values():
             # remove defaults only on complete columns
             # if is_complete_column(c):
             #     remove_column_defaults(c)
@@ -115,53 +130,22 @@ def remove_defaults(stored_schema: TStoredSchema) -> TStoredSchema:
     return stored_schema
 
 
-def has_default_column_hint_value(hint: str, value: Any) -> bool:
-    """Checks if `value` is a default for `hint`. Only known column hints (COLUMN_HINTS) are checked"""
+def has_default_column_prop_value(prop: str, value: Any) -> bool:
+    """Checks if `value` is a default for `prop`."""
     # remove all boolean hints that are False, except "nullable" which is removed when it is True
-    if hint in COLUMN_HINTS and value is False:
-        return True
-    if hint == "nullable" and value is True:
-        return True
-    return False
+    if prop in ColumnPropInfos:
+        return value in ColumnPropInfos[prop].defaults
+    # for any unknown hint ie. "x-" the defaults are
+    return value in (None, False)
 
 
 def remove_column_defaults(column_schema: TColumnSchema) -> TColumnSchema:
     """Removes default values from `column_schema` in place, returns the input for chaining"""
     # remove hints with default values
     for h in list(column_schema.keys()):
-        if has_default_column_hint_value(h, column_schema[h]):  # type: ignore
-            del column_schema[h]  # type: ignore
-        elif column_schema[h] is None:  # type: ignore
+        if has_default_column_prop_value(h, column_schema[h]):  # type: ignore
             del column_schema[h]  # type: ignore
     return column_schema
-
-
-def add_column_defaults(column: TColumnSchemaBase) -> TColumnSchema:
-    """Adds default boolean hints to column"""
-    return {
-        **{
-            "nullable": True,
-            "partition": False,
-            "cluster": False,
-            "unique": False,
-            "sort": False,
-            "primary_key": False,
-            "foreign_key": False,
-            "root_key": False,
-            "merge_key": False,
-        },
-        **column,
-    }
-
-
-# def add_complete_column_defaults(column: TColumnSchemaBase) -> TColumnSchema:
-#     """Adds default hints to `column` if it is completed, otherwise preserves `column` content intact
-
-#        Always returns a shallow copy of `column`
-#     """
-#     if is_complete_column(column):
-#         return add_column_defaults(column)
-#     return copy(column)  # type: ignore
 
 
 def bump_version_if_modified(stored_schema: TStoredSchema) -> Tuple[int, str, str, Sequence[str]]:
@@ -226,14 +210,41 @@ def verify_schema_hash(
     return hash_ == stored_schema["version_hash"]
 
 
+def normalize_simple_regex_column(naming: NamingConvention, regex: TSimpleRegex) -> TSimpleRegex:
+    """Assumes that regex applies to column name and normalizes it."""
+
+    def _normalize(r_: str) -> str:
+        is_exact = len(r_) >= 2 and r_[0] == "^" and r_[-1] == "$"
+        if is_exact:
+            r_ = r_[1:-1]
+        # if this a simple string then normalize it
+        if r_ == re.escape(r_):
+            r_ = naming.normalize_path(r_)
+        if is_exact:
+            r_ = "^" + r_ + "$"
+        return r_
+
+    if regex.startswith(SIMPLE_REGEX_PREFIX):
+        return cast(TSimpleRegex, SIMPLE_REGEX_PREFIX + _normalize(regex[3:]))
+    else:
+        return cast(TSimpleRegex, _normalize(regex))
+
+
+def canonical_simple_regex(regex: str) -> TSimpleRegex:
+    if regex.startswith(SIMPLE_REGEX_PREFIX):
+        return cast(TSimpleRegex, regex)
+    else:
+        return cast(TSimpleRegex, SIMPLE_REGEX_PREFIX + "^" + regex + "$")
+
+
 def simple_regex_validator(path: str, pk: str, pv: Any, t: Any) -> bool:
     # custom validator on type TSimpleRegex
     if t is TSimpleRegex:
         if not isinstance(pv, str):
             raise DictValidationException(
-                f"In {path}: field {pk} value {pv} has invalid type {type(pv).__name__} while str"
-                " is expected",
+                f"field {pk} value {pv} has invalid type {type(pv).__name__} while str is expected",
                 path,
+                t,
                 pk,
                 pv,
             )
@@ -243,23 +254,25 @@ def simple_regex_validator(path: str, pk: str, pv: Any, t: Any) -> bool:
                 re.compile(pv[3:])
             except Exception as e:
                 raise DictValidationException(
-                    f"In {path}: field {pk} value {pv[3:]} does not compile as regex: {str(e)}",
+                    f"field {pk} value {pv[3:]} does not compile as regex: {str(e)}",
                     path,
+                    t,
                     pk,
                     pv,
                 )
         else:
             if RE_NON_ALPHANUMERIC_UNDERSCORE.match(pv):
                 raise DictValidationException(
-                    f"In {path}: field {pk} value {pv} looks like a regex, please prefix with re:",
+                    f"field {pk} value {pv} looks like a regex, please prefix with re:",
                     path,
+                    t,
                     pk,
                     pv,
                 )
         # we know how to validate that type
         return True
     else:
-        # don't know how to validate t
+        # don't know how to validate this
         return False
 
 
@@ -268,20 +281,21 @@ def column_name_validator(naming: NamingConvention) -> TCustomValidator:
         if t is TColumnName:
             if not isinstance(pv, str):
                 raise DictValidationException(
-                    f"In {path}: field {pk} value {pv} has invalid type {type(pv).__name__} while"
+                    f"field {pk} value {pv} has invalid type {type(pv).__name__} while"
                     " str is expected",
                     path,
+                    t,
                     pk,
                     pv,
                 )
             try:
                 if naming.normalize_path(pv) != pv:
                     raise DictValidationException(
-                        f"In {path}: field {pk}: {pv} is not a valid column name", path, pk, pv
+                        f"field {pk}: {pv} is not a valid column name", path, t, pk, pv
                     )
             except ValueError:
                 raise DictValidationException(
-                    f"In {path}: field {pk}: {pv} is not a valid column name", path, pk, pv
+                    f"field {pk}: {pv} is not a valid column name", path, t, pk, pv
                 )
             return True
         else:
@@ -320,7 +334,9 @@ def validate_stored_schema(stored_schema: TStoredSchema) -> None:
         parent_table_name = table.get("parent")
         if parent_table_name:
             if parent_table_name not in stored_schema["tables"]:
-                raise ParentTableNotFoundException(table_name, parent_table_name)
+                raise ParentTableNotFoundException(
+                    stored_schema["name"], table_name, parent_table_name
+                )
 
 
 def autodetect_sc_type(detection_fs: Sequence[TTypeDetections], t: Type[Any], v: Any) -> TDataType:
@@ -339,11 +355,49 @@ def is_complete_column(col: TColumnSchemaBase) -> bool:
     return bool(col.get("name")) and bool(col.get("data_type"))
 
 
+def is_nullable_column(col: TColumnSchemaBase) -> bool:
+    """Returns true if column is nullable"""
+    return col.get("nullable", True)
+
+
+def find_incomplete_columns(table: TTableSchema) -> Iterable[Tuple[TColumnSchemaBase, bool]]:
+    """Yields (column, nullable) for all incomplete columns in `table`"""
+    for col in table["columns"].values():
+        if not is_complete_column(col):
+            yield col, is_nullable_column(col)
+
+
 def compare_complete_columns(a: TColumnSchema, b: TColumnSchema) -> bool:
     """Compares mandatory fields of complete columns"""
     assert is_complete_column(a)
     assert is_complete_column(b)
     return a["data_type"] == b["data_type"] and a["name"] == b["name"]
+
+
+def compare_table_references(a: TTableReference, b: TTableReference) -> bool:
+    if a["referenced_table"] != b["referenced_table"]:
+        return False
+    a_col_map = dict(zip(a["columns"], a["referenced_columns"]))
+    b_col_map = dict(zip(b["columns"], b["referenced_columns"]))
+    return a_col_map == b_col_map
+
+
+def diff_table_references(
+    a: Sequence[TTableReference], b: Sequence[TTableReference]
+) -> List[TTableReference]:
+    """Return a list of references containing references matched by table:
+    * References from `b` that are not in `a`
+    * References from `b` that are different from the one in `a`
+    """
+    a_refs_mapping = {ref["referenced_table"]: ref for ref in a}
+    new_refs: List[TTableReference] = []
+    for b_ref in b:
+        table_name = b_ref["referenced_table"]
+        if table_name not in a_refs_mapping:
+            new_refs.append(b_ref)
+        elif not compare_table_references(a_refs_mapping[table_name], b_ref):
+            new_refs.append(b_ref)
+    return new_refs
 
 
 def merge_column(
@@ -360,21 +414,58 @@ def merge_column(
     return col_a
 
 
-def diff_table(tab_a: TTableSchema, tab_b: TPartialTableSchema) -> TPartialTableSchema:
+def merge_columns(
+    columns_a: TTableSchemaColumns,
+    columns_b: TTableSchemaColumns,
+    merge_columns: bool = False,
+    columns_partial: bool = True,
+) -> TTableSchemaColumns:
+    """Merges `columns_a` with `columns_b`. `columns_a` is modified in place.
+
+    * new columns are added
+    * if `merge_columns` is False, updated columns are replaced from `columns_b`
+    * if `merge_columns` is True, updated columns are merged with `merge_column`
+    * if `columns_partial` is True, both columns sets are considered incomplete. In that case hints like `primary_key` or `merge_key` are merged
+    * if `columns_partial` is False, hints like `primary_key` and `merge_key` are dropped from `columns_a` and replaced from `columns_b`
+    * incomplete columns in `columns_a` that got completed in `columns_b` are removed to preserve order
+    """
+    if columns_partial is False:
+        raise NotImplementedError("columns_partial must be False for merge_columns")
+
+    # remove incomplete columns in table that are complete in diff table
+    for col_name, column_b in columns_b.items():
+        column_a = columns_a.get(col_name)
+        if is_complete_column(column_b):
+            if column_a and not is_complete_column(column_a):
+                columns_a.pop(col_name)
+        if column_a and merge_columns:
+            column_b = merge_column(column_a, column_b)
+        # set new or updated column
+        columns_a[col_name] = column_b
+    return columns_a
+
+
+def diff_table(
+    schema_name: str, tab_a: TTableSchema, tab_b: TPartialTableSchema
+) -> TPartialTableSchema:
     """Creates a partial table that contains properties found in `tab_b` that are not present or different in `tab_a`.
     The name is always present in returned partial.
     It returns new columns (not present in tab_a) and merges columns from tab_b into tab_a (overriding non-default hint values).
     If any columns are returned they contain full data (not diffs of columns)
 
     Raises SchemaException if tables cannot be merged
-    * when columns with the same name  have different data types
+    * when columns with the same name have different data types
     * when table links to different parent tables
     """
+    if tab_a["name"] != tab_b["name"]:
+        raise TablePropertiesConflictException(
+            schema_name, tab_a["name"], "name", tab_a["name"], tab_b["name"]
+        )
     table_name = tab_a["name"]
     # check if table properties can be merged
     if tab_a.get("parent") != tab_b.get("parent"):
         raise TablePropertiesConflictException(
-            table_name, "parent", tab_a.get("parent"), tab_b.get("parent")
+            schema_name, table_name, "parent", tab_a.get("parent"), tab_b.get("parent")
         )
 
     # get new columns, changes in the column data type or other properties are not allowed
@@ -388,6 +479,7 @@ def diff_table(tab_a: TTableSchema, tab_b: TPartialTableSchema) -> TPartialTable
                 if not compare_complete_columns(tab_a_columns[col_b_name], col_b):
                     # attempt to update to incompatible columns
                     raise CannotCoerceColumnException(
+                        schema_name,
                         table_name,
                         col_b_name,
                         col_b["data_type"],
@@ -406,6 +498,11 @@ def diff_table(tab_a: TTableSchema, tab_b: TPartialTableSchema) -> TPartialTable
         "name": table_name,
         "columns": {} if new_columns is None else {c["name"]: c for c in new_columns},
     }
+
+    new_references = diff_table_references(tab_a.get("references", []), tab_b.get("references", []))
+    if new_references:
+        partial_table["references"] = new_references
+
     for k, v in tab_b.items():
         if k in ["columns", None]:
             continue
@@ -414,9 +511,9 @@ def diff_table(tab_a: TTableSchema, tab_b: TPartialTableSchema) -> TPartialTable
             partial_table[k] = v  # type: ignore
 
     # this should not really happen
-    if tab_a.get("parent") is not None and (resource := tab_b.get("resource")):
+    if is_nested_table(tab_a) and (resource := tab_b.get("resource")):
         raise TablePropertiesConflictException(
-            table_name, "resource", resource, tab_a.get("parent")
+            schema_name, table_name, "resource", resource, tab_a.get("parent")
         )
 
     return partial_table
@@ -434,42 +531,112 @@ def diff_table(tab_a: TTableSchema, tab_b: TPartialTableSchema) -> TPartialTable
 #         return False
 
 
-def merge_table(table: TTableSchema, partial_table: TPartialTableSchema) -> TPartialTableSchema:
+def merge_table(
+    schema_name: str, table: TTableSchema, partial_table: TPartialTableSchema
+) -> TPartialTableSchema:
     """Merges "partial_table" into "table". `table` is merged in place. Returns the diff partial table.
+    `table` and `partial_table` names must be identical. A table diff is generated and applied to `table`
+    """
+    return merge_diff(table, diff_table(schema_name, table, partial_table))
 
-    `table` and `partial_table` names must be identical. A table diff is generated and applied to `table`:
+
+def merge_diff(table: TTableSchema, table_diff: TPartialTableSchema) -> TPartialTableSchema:
+    """Merges a table diff `table_diff` into `table`. `table` is merged in place. Returns the diff.
     * new columns are added, updated columns are replaced from diff
     * incomplete columns in `table` that got completed in `partial_table` are removed to preserve order
     * table hints are added or replaced from diff
     * nothing gets deleted
     """
-
-    if table["name"] != partial_table["name"]:
-        raise TablePropertiesConflictException(
-            table["name"], "name", table["name"], partial_table["name"]
-        )
-    diff = diff_table(table, partial_table)
-    # remove incomplete columns in table that are complete in diff table
-    for col_name, column in diff["columns"].items():
-        if is_complete_column(column):
-            table_column = table["columns"].get(col_name)
-            if table_column and not is_complete_column(table_column):
-                table["columns"].pop(col_name)
     # add new columns when all checks passed
-    table["columns"].update(diff["columns"])
-    updated_columns = table["columns"]
-    table.update(diff)
+    updated_columns = merge_columns(table["columns"], table_diff["columns"])
+    table.update(table_diff)
     table["columns"] = updated_columns
 
-    return diff
+    return table_diff
+
+
+def normalize_table_identifiers(table: TTableSchema, naming: NamingConvention) -> TTableSchema:
+    """Normalizes all table and column names in `table` schema according to current schema naming convention and returns
+    new instance with modified table schema.
+
+    Naming convention like snake_case may produce name collisions with the column names. Colliding column schemas are merged
+    where the column that is defined later in the dictionary overrides earlier column.
+
+    Note that resource name is not normalized.
+    """
+
+    table = copy(table)
+    table["name"] = naming.normalize_tables_path(table["name"])
+    parent = table.get("parent")
+    if parent:
+        table["parent"] = naming.normalize_tables_path(parent)
+    columns = table.get("columns")
+    if columns:
+        new_columns: TTableSchemaColumns = {}
+        for c in columns.values():
+            c = copy(c)
+            origin_c_name = c["name"]
+            new_col_name = c["name"] = naming.normalize_path(c["name"])
+            # re-index columns as the name changed, if name space was reduced then
+            # some columns now collide with each other. so make sure that we merge columns that are already there
+            if new_col_name in new_columns:
+                new_columns[new_col_name] = merge_column(
+                    new_columns[new_col_name], c, merge_defaults=False
+                )
+                logger.warning(
+                    f"In schema {naming} column {origin_c_name} got normalized into"
+                    f" {new_col_name} which collides with other column. Both columns got merged"
+                    " into one."
+                )
+            else:
+                new_columns[new_col_name] = c
+        table["columns"] = new_columns
+    references = table.get("references")
+    if references:
+        new_references = {}
+        for ref in references:
+            new_ref = copy(ref)
+            new_ref["referenced_table"] = naming.normalize_tables_path(ref["referenced_table"])
+            new_ref["columns"] = [naming.normalize_path(c) for c in ref["columns"]]
+            new_ref["referenced_columns"] = [
+                naming.normalize_path(c) for c in ref["referenced_columns"]
+            ]
+            if new_ref["referenced_table"] in new_references:
+                logger.warning(
+                    f"In schema {naming} table {table['name']} has multiple references to"
+                    f" {new_ref['referenced_table']}. Only the last one is preserved."
+                )
+            new_references[new_ref["referenced_table"]] = new_ref
+
+        table["references"] = list(new_references.values())
+    return table
 
 
 def has_table_seen_data(table: TTableSchema) -> bool:
     """Checks if normalizer has seen data coming to the table."""
-    return "x-normalizer" in table and table["x-normalizer"].get("seen-data", None) is True  # type: ignore[typeddict-item]
+    return "x-normalizer" in table and table["x-normalizer"].get("seen-data", None) is True
 
 
-def hint_to_column_prop(h: TColumnHint) -> TColumnProp:
+def remove_processing_hints(tables: TSchemaTables) -> TSchemaTables:
+    "Removes processing hints like x-normalizer and x-loader from schema tables. Modifies the input tables and returns it for convenience"
+    for table_name, hints in get_processing_hints(tables).items():
+        for hint in hints:
+            del tables[table_name][hint]  # type: ignore[misc]
+    return tables
+
+
+def get_processing_hints(tables: TSchemaTables) -> Dict[str, List[str]]:
+    """Finds processing hints in a set of tables and returns table_name: [hints] mapping"""
+    hints: Dict[str, List[str]] = {}
+    for table in tables.values():
+        for hint in TTableProcessingHints.__annotations__.keys():
+            if hint in table:
+                table_hints = hints.setdefault(table["name"], [])
+                table_hints.append(hint)
+    return hints
+
+
+def hint_to_column_prop(h: TColumnDefaultHint) -> TColumnProp:
     if h == "not_null":
         return "nullable"
     return h
@@ -478,12 +645,11 @@ def hint_to_column_prop(h: TColumnHint) -> TColumnProp:
 def get_columns_names_with_prop(
     table: TTableSchema, column_prop: Union[TColumnProp, str], include_incomplete: bool = False
 ) -> List[str]:
-    # column_prop: TColumnProp = hint_to_column_prop(hint_type)
-    # default = column_prop != "nullable"  # default is true, only for nullable false
     return [
-        c["name"]
-        for c in table["columns"].values()
-        if (bool(c.get(column_prop, False)) or c.get(column_prop, False) is None)
+        c_n
+        for c_n, c in table["columns"].items()
+        if column_prop in c
+        and not has_default_column_prop_value(column_prop, c[column_prop])  # type: ignore[literal-required]
         and (include_incomplete or is_complete_column(c))
     ]
 
@@ -554,9 +720,8 @@ def get_inherited_table_hint(
     if hint:
         return hint
 
-    parent = table.get("parent")
-    if parent:
-        return get_inherited_table_hint(tables, parent, table_hint_name, allow_none)
+    if is_nested_table(table):
+        return get_inherited_table_hint(tables, table.get("parent"), table_hint_name, allow_none)
 
     if allow_none:
         return None
@@ -580,17 +745,37 @@ def get_table_format(tables: TSchemaTables, table_name: str) -> TTableFormat:
     )
 
 
+def get_file_format(tables: TSchemaTables, table_name: str) -> TFileFormat:
+    return cast(
+        TFileFormat, get_inherited_table_hint(tables, table_name, "file_format", allow_none=True)
+    )
+
+
+def get_merge_strategy(tables: TSchemaTables, table_name: str) -> TLoaderMergeStrategy:
+    return cast(
+        TLoaderMergeStrategy,
+        get_inherited_table_hint(tables, table_name, "x-merge-strategy", allow_none=True),
+    )
+
+
 def fill_hints_from_parent_and_clone_table(
     tables: TSchemaTables, table: TTableSchema
 ) -> TTableSchema:
     """Takes write disposition and table format from parent tables if not present"""
     # make a copy of the schema so modifications do not affect the original document
     table = deepcopy(table)
-    # add write disposition if not specified - in child tables
+    table_name = table["name"]
     if "write_disposition" not in table:
-        table["write_disposition"] = get_write_disposition(tables, table["name"])
+        table["write_disposition"] = get_write_disposition(tables, table_name)
     if "table_format" not in table:
-        table["table_format"] = get_table_format(tables, table["name"])
+        if table_format := get_table_format(tables, table_name):
+            table["table_format"] = table_format
+    if "file_format" not in table:
+        if file_format := get_file_format(tables, table_name):
+            table["file_format"] = file_format
+    if "x-merge-strategy" not in table:
+        if strategy := get_merge_strategy(tables, table_name):
+            table["x-merge-strategy"] = strategy  # type: ignore[typeddict-unknown-key]
     return table
 
 
@@ -607,24 +792,26 @@ def table_schema_has_type_with_precision(table: TTableSchema, _typ: TDataType) -
     )
 
 
-def get_top_level_table(tables: TSchemaTables, table_name: str) -> TTableSchema:
-    """Finds top level (without parent) of a `table_name` following the ancestry hierarchy."""
+def get_root_table(tables: TSchemaTables, table_name: str) -> TTableSchema:
+    """Finds root (without parent) of a `table_name` following the nested references (row_key - parent_key)."""
     table = tables[table_name]
-    parent = table.get("parent")
-    if parent:
-        return get_top_level_table(tables, parent)
+    if is_nested_table(table):
+        return get_root_table(tables, table.get("parent"))
     return table
 
 
-def get_child_tables(tables: TSchemaTables, table_name: str) -> List[TTableSchema]:
-    """Get child tables for table name and return a list of tables ordered by ancestry so the child tables are always after their parents"""
+def get_nested_tables(tables: TSchemaTables, table_name: str) -> List[TTableSchema]:
+    """Get nested tables for table name and return a list of tables ordered by ancestry so the nested tables are always after their parents
+
+    Note that this function follows only NESTED TABLE reference typically expressed on _dlt_parent_id (PARENT_KEY) to _dlt_id (ROW_KEY).
+    """
     chain: List[TTableSchema] = []
 
     def _child(t: TTableSchema) -> None:
         name = t["name"]
         chain.append(t)
         for candidate in tables.values():
-            if candidate.get("parent") == name:
+            if is_nested_table(candidate) and candidate.get("parent") == name:
                 _child(candidate)
 
     _child(tables[table_name])
@@ -642,13 +829,32 @@ def group_tables_by_resource(
         resource = table.get("resource")
         if resource and (pattern is None or pattern.match(resource)):
             resource_tables = result.setdefault(resource, [])
-            resource_tables.extend(get_child_tables(tables, table["name"]))
+            resource_tables.extend(get_nested_tables(tables, table["name"]))
     return result
+
+
+def migrate_complex_types(table: TTableSchema, warn: bool = False) -> None:
+    if "columns" not in table:
+        return
+    table_name = table.get("name")
+    for col_name, column in table["columns"].items():
+        if data_type := column.get("data_type"):
+            if data_type == "complex":
+                if warn:
+                    warnings.warn(
+                        f"`complex` data type found on column {col_name} table {table_name} is"
+                        " deprecated. Please use `json` type instead.",
+                        Dlt100DeprecationWarning,
+                        stacklevel=3,
+                    )
+                column["data_type"] = "json"
 
 
 def version_table() -> TTableSchema:
     # NOTE: always add new columns at the end of the table so we have identical layout
     # after an update of existing tables (always at the end)
+    # set to nullable so we can migrate existing tables
+    # WARNING: do not reorder the columns
     table = new_table(
         VERSION_TABLE_NAME,
         columns=[
@@ -669,9 +875,11 @@ def version_table() -> TTableSchema:
     return table
 
 
-def load_table() -> TTableSchema:
+def loads_table() -> TTableSchema:
     # NOTE: always add new columns at the end of the table so we have identical layout
     # after an update of existing tables (always at the end)
+    # set to nullable so we can migrate existing tables
+    # WARNING: do not reorder the columns
     table = new_table(
         LOADS_TABLE_NAME,
         columns=[
@@ -691,6 +899,49 @@ def load_table() -> TTableSchema:
     return table
 
 
+def dlt_id_column() -> TColumnSchema:
+    """Definition of dlt id column"""
+    return {
+        "name": C_DLT_ID,
+        "data_type": "text",
+        "nullable": False,
+        "unique": True,
+        "row_key": True,
+    }
+
+
+def dlt_load_id_column() -> TColumnSchema:
+    """Definition of dlt load id column"""
+    return {"name": "_dlt_load_id", "data_type": "text", "nullable": False}
+
+
+def pipeline_state_table(add_dlt_id: bool = False) -> TTableSchema:
+    # NOTE: always add new columns at the end of the table so we have identical layout
+    # after an update of existing tables (always at the end)
+    # set to nullable so we can migrate existing tables
+    # WARNING: do not reorder the columns
+    columns: List[TColumnSchema] = [
+        {"name": "version", "data_type": "bigint", "nullable": False},
+        {"name": "engine_version", "data_type": "bigint", "nullable": False},
+        {"name": "pipeline_name", "data_type": "text", "nullable": False},
+        {"name": "state", "data_type": "text", "nullable": False},
+        {"name": "created_at", "data_type": "timestamp", "nullable": False},
+        {"name": "version_hash", "data_type": "text", "nullable": True},
+        dlt_load_id_column(),
+    ]
+    if add_dlt_id:
+        columns.append(dlt_id_column())
+    table = new_table(
+        PIPELINE_STATE_TABLE_NAME,
+        write_disposition="append",
+        columns=columns,
+        # always use caps preferred file format for processing
+        file_format="preferred",
+    )
+    table["description"] = "Created by DLT. Tracks pipeline state"
+    return table
+
+
 def new_table(
     table_name: str,
     parent_table_name: str = None,
@@ -700,31 +951,45 @@ def new_table(
     resource: str = None,
     schema_contract: TSchemaContract = None,
     table_format: TTableFormat = None,
+    file_format: TFileFormat = None,
+    references: Sequence[TTableReference] = None,
 ) -> TTableSchema:
     table: TTableSchema = {
         "name": table_name,
         "columns": {} if columns is None else {c["name"]: c for c in columns},
     }
+
+    if write_disposition:
+        table["write_disposition"] = write_disposition
+    if resource:
+        table["resource"] = resource
+    if schema_contract is not None:
+        table["schema_contract"] = schema_contract
+    if table_format:
+        table["table_format"] = table_format
+    if file_format:
+        table["file_format"] = file_format
+    if references:
+        table["references"] = references
     if parent_table_name:
         table["parent"] = parent_table_name
-        assert write_disposition is None
-        assert resource is None
-        assert schema_contract is None
     else:
-        # set write disposition only for root tables
-        table["write_disposition"] = write_disposition or DEFAULT_WRITE_DISPOSITION
-        table["resource"] = resource or table_name
-        if schema_contract is not None:
-            table["schema_contract"] = schema_contract
-        if table_format:
-            table["table_format"] = table_format
+        # set only for root tables
+        if not write_disposition:
+            # set write disposition only for root tables
+            table["write_disposition"] = DEFAULT_WRITE_DISPOSITION
+        if not resource:
+            table["resource"] = table_name
+
+    # migrate complex types to json
+    migrate_complex_types(table, warn=True)
+
     if validate_schema:
         validate_dict_ignoring_xkeys(
             spec=TColumnSchema,
             doc=table["columns"],
             path=f"new_table/{table_name}",
         )
-
     return table
 
 
@@ -753,7 +1018,7 @@ def new_column(
     return column
 
 
-def standard_hints() -> Dict[TColumnHint, List[TSimpleRegex]]:
+def default_hints() -> Dict[TColumnDefaultHint, List[TSimpleRegex]]:
     return None
 
 

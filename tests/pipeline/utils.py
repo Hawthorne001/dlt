@@ -1,5 +1,4 @@
-import posixpath
-from typing import Any, Dict, List, Tuple, Callable, Sequence
+from typing import Any, Dict, List, Set, Callable, Sequence
 import pytest
 import random
 from os import environ
@@ -7,15 +6,17 @@ import io
 
 import dlt
 from dlt.common import json, sleep
+from dlt.common.configuration.utils import auto_cast
+from dlt.common.data_types import py_type_to_sc_type
 from dlt.common.pipeline import LoadInfo
-from dlt.common.schema.typing import LOADS_TABLE_NAME
+from dlt.common.schema.utils import get_table_format
 from dlt.common.typing import DictStrAny
 from dlt.destinations.impl.filesystem.filesystem import FilesystemClient
 from dlt.destinations.fs_client import FSClientBase
-from dlt.pipeline.exceptions import SqlClientNotAvailable
-from dlt.common.storages import FileStorage
+from dlt.destinations.exceptions import DatabaseUndefinedRelation
 
-from tests.utils import TEST_STORAGE_ROOT
+from dlt.common.schema.typing import TTableSchema
+
 
 PIPELINE_TEST_CASES_PATH = "./tests/pipeline/cases/"
 
@@ -48,12 +49,14 @@ def airtable_emojis():
 
     @dlt.resource(name="🦚Peacock", selected=False, primary_key="🔑id")
     def peacock():
-        dlt.current.resource_state()["🦚🦚🦚"] = "🦚"
+        r_state = dlt.current.resource_state()
+        r_state.setdefault("🦚🦚🦚", "")
+        r_state["🦚🦚🦚"] += "🦚"
         yield [{"peacock": [1, 2, 3], "🔑id": 1}]
 
     @dlt.resource(name="🦚WidePeacock", selected=False)
     def wide_peacock():
-        yield [{"peacock": [1, 2, 3]}]
+        yield [{"Peacock": [1, 2, 3]}]
 
     return budget, schedule, peacock, wide_peacock
 
@@ -74,6 +77,21 @@ def many_delayed(many, iters):
         yield dlt.resource(run_deferred(iters), name="resource_" + str(n))
 
 
+@dlt.resource(table_name="users")
+def users_materialize_table_schema():
+    yield dlt.mark.with_hints(
+        # this is a special empty item which will materialize table schema
+        dlt.mark.materialize_table_schema(),
+        # emit table schema with the item
+        dlt.mark.make_hints(
+            columns=[
+                {"name": "id", "data_type": "bigint", "precision": 4, "nullable": False},
+                {"name": "name", "data_type": "text", "nullable": False},
+            ]
+        ),
+    )
+
+
 #
 # Utils for accessing data in pipelines
 #
@@ -81,6 +99,9 @@ def many_delayed(many, iters):
 
 def assert_load_info(info: LoadInfo, expected_load_packages: int = 1) -> None:
     """Asserts that expected number of packages was loaded and there are no failed jobs"""
+    # make sure we can serialize
+    info.asstr(verbosity=2)
+    info.asdict()
     assert len(info.loads_ids) == expected_load_packages
     # all packages loaded
     assert all(p.completed_at is not None for p in info.load_packages) is True
@@ -127,7 +148,7 @@ def _load_file(client: FSClientBase, filepath) -> List[Dict[str, Any]]:
         cols = lines[0][15:-2].split(",")
         for line in lines[2:]:
             if line:
-                values = line[1:-3].split(",")
+                values = map(auto_cast, line[1:-3].split(","))
                 result.append(dict(zip(cols, values)))
 
     # load parquet
@@ -155,30 +176,51 @@ def _load_file(client: FSClientBase, filepath) -> List[Dict[str, Any]]:
 #
 # Load table dicts
 #
-def _load_tables_to_dicts_fs(p: dlt.Pipeline, *table_names: str) -> Dict[str, List[Dict[str, Any]]]:
+
+
+def _load_tables_to_dicts_fs(
+    p: dlt.Pipeline, *table_names: str, schema_name: str = None
+) -> Dict[str, List[Dict[str, Any]]]:
     """For now this will expect the standard layout in the filesystem destination, if changed the results will not be correct"""
-    client = p._fs_client()
+    client = p._fs_client(schema_name=schema_name)
+    assert isinstance(client, FilesystemClient)
+
     result: Dict[str, Any] = {}
 
+    delta_table_names = [
+        table_name
+        for table_name in table_names
+        if get_table_format(client.schema.tables, table_name) == "delta"
+    ]
+    if len(delta_table_names) > 0:
+        from dlt.common.libs.deltalake import get_delta_tables
+
+        delta_tables = get_delta_tables(p, *table_names, schema_name=schema_name)
+
     for table_name in table_names:
-        table_files = client.list_table_files(table_name)
-        for file in table_files:
-            items = _load_file(client, file)
-            if table_name in result:
-                result[table_name] = result[table_name] + items
-            else:
-                result[table_name] = items
+        if table_name in client.schema.data_table_names() and table_name in delta_table_names:
+            dt = delta_tables[table_name]
+            result[table_name] = dt.to_pyarrow_table().to_pylist()
+        else:
+            table_files = client.list_table_files(table_name)
+            for file in table_files:
+                items = _load_file(client, file)
+                if table_name in result:
+                    result[table_name] = result[table_name] + items
+                else:
+                    result[table_name] = items
     return result
 
 
 def _load_tables_to_dicts_sql(
-    p: dlt.Pipeline, *table_names: str
+    p: dlt.Pipeline, *table_names: str, schema_name: str = None
 ) -> Dict[str, List[Dict[str, Any]]]:
     result = {}
+    schema = p.default_schema if not schema_name else p.schemas[schema_name]
     for table_name in table_names:
         table_rows = []
-        columns = p.default_schema.get_table_columns(table_name).keys()
-        query_columns = ",".join(map(p.sql_client().capabilities.escape_identifier, columns))
+        columns = schema.get_table_columns(table_name).keys()
+        query_columns = ",".join(map(p.sql_client().escape_column_name, columns))
 
         with p.sql_client() as c:
             query_columns = ",".join(map(c.escape_column_name, columns))
@@ -191,9 +233,48 @@ def _load_tables_to_dicts_sql(
     return result
 
 
-def load_tables_to_dicts(p: dlt.Pipeline, *table_names: str) -> Dict[str, List[Dict[str, Any]]]:
-    func = _load_tables_to_dicts_fs if _is_filesystem(p) else _load_tables_to_dicts_sql
-    return func(p, *table_names)
+def load_tables_to_dicts(
+    p: dlt.Pipeline,
+    *table_names: str,
+    schema_name: str = None,
+    exclude_system_cols: bool = False,
+    sortkey: str = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    def _exclude_system_cols(dict_: Dict[str, Any]) -> Dict[str, Any]:
+        return {k: v for k, v in dict_.items() if not k.startswith("_dlt")}
+
+    def _sort_list_of_dicts(list_: List[Dict[str, Any]], sortkey: str) -> List[Dict[str, Any]]:
+        """Sort list of dictionaries by dictionary key."""
+        return sorted(list_, key=lambda d: d[sortkey])
+
+    if _is_filesystem(p):
+        result = _load_tables_to_dicts_fs(p, *table_names, schema_name=schema_name)
+    else:
+        result = _load_tables_to_dicts_sql(p, *table_names, schema_name=schema_name)
+
+    if exclude_system_cols:
+        result = {k: [_exclude_system_cols(d) for d in v] for k, v in result.items()}
+    if sortkey is not None:
+        result = {k: _sort_list_of_dicts(v, sortkey) for k, v in result.items()}
+    return result
+
+
+def assert_records_as_set(actual: List[Dict[str, Any]], expected: List[Dict[str, Any]]) -> None:
+    """Compares two lists of dicts regardless of order"""
+    actual_set = set(frozenset(dict_.items()) for dict_ in actual)
+    expected_set = set(frozenset(dict_.items()) for dict_ in expected)
+    assert actual_set == expected_set
+
+
+def assert_only_table_columns(
+    p: dlt.Pipeline, table_name: str, expected_columns: Sequence[str], schema_name: str = None
+) -> None:
+    """Table has all and only the expected columns (excluding _dlt columns)"""
+    rows = load_tables_to_dicts(p, table_name, schema_name=schema_name)[table_name]
+    assert rows, f"Table {table_name} is empty"
+    # Ignore _dlt columns
+    columns = set(col for col in rows[0].keys() if not col.startswith("_dlt"))
+    assert columns == set(expected_columns)
 
 
 #
@@ -242,6 +323,22 @@ def assert_data_table_counts(p: dlt.Pipeline, expected_counts: DictStrAny) -> No
 #
 # TODO: migrate to be able to do full assertions on filesystem too, should be possible
 #
+
+
+def table_exists(p: dlt.Pipeline, table_name: str, schema_name: str = None) -> bool:
+    """Returns True if table exists in the destination database/filesystem"""
+    if _is_filesystem(p):
+        client = p._fs_client(schema_name=schema_name)
+        files = client.list_table_files(table_name)
+        return not not files
+
+    with p.sql_client(schema_name=schema_name) as c:
+        try:
+            qual_table_name = c.make_qualified_table_name(table_name)
+            c.execute_sql(f"SELECT 1 FROM {qual_table_name} LIMIT 1")
+            return True
+        except DatabaseUndefinedRelation:
+            return False
 
 
 def _assert_table_sql(
@@ -324,3 +421,68 @@ def assert_query_data(
         # the second is load id
         if info:
             assert row[1] in info.loads_ids
+
+
+def assert_schema_on_data(
+    table_schema: TTableSchema,
+    rows: List[Dict[str, Any]],
+    requires_nulls: bool,
+    check_nested: bool,
+) -> None:
+    """Asserts that `rows` conform to `table_schema`. Fields and their order must conform to columns. Null values and
+    python data types are checked.
+    """
+    table_columns = table_schema["columns"]
+    columns_with_nulls: Set[str] = set()
+    for row in rows:
+        # check columns
+        assert set(table_schema["columns"].keys()) == set(row.keys())
+        # check column order
+        assert list(table_schema["columns"].keys()) == list(row.keys())
+        # check data types
+        for key, value in row.items():
+            print(key)
+            print(value)
+            if value is None:
+                assert table_columns[key][
+                    "nullable"
+                ], f"column {key} must be nullable: value is None"
+                # next value. we cannot validate data type
+                columns_with_nulls.add(key)
+                continue
+            expected_dt = table_columns[key]["data_type"]
+            # allow json strings
+            if expected_dt == "json":
+                if check_nested:
+                    # NOTE: we expect a dict or a list here. simple types of null will fail the test
+                    value = json.loads(value)
+                else:
+                    # skip checking nested types
+                    continue
+            actual_dt = py_type_to_sc_type(type(value))
+            assert actual_dt == expected_dt
+
+    if requires_nulls:
+        # make sure that all nullable columns in table received nulls
+        assert (
+            set(col["name"] for col in table_columns.values() if col["nullable"])
+            == columns_with_nulls
+        ), "Some columns didn't receive NULLs which is required"
+
+
+def load_table_distinct_counts(
+    p: dlt.Pipeline, distinct_column: str, *table_names: str
+) -> DictStrAny:
+    """Returns counts of distinct values for column `distinct_column` for `table_names` as dict"""
+    with p.sql_client() as c:
+        query = "\nUNION ALL\n".join(
+            [
+                f"SELECT '{name}' as name, COUNT(DISTINCT {distinct_column}) as c FROM"
+                f" {c.make_qualified_table_name(name)}"
+                for name in table_names
+            ]
+        )
+
+        with c.execute_query(query) as cur:
+            rows = list(cur.fetchall())
+            return {r[0]: r[1] for r in rows}

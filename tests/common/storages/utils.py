@@ -1,3 +1,5 @@
+import os
+import glob
 from pathlib import Path
 from urllib.parse import urlparse
 import pytest
@@ -14,13 +16,31 @@ from dlt.common.storages import (
     LoadStorageConfiguration,
     FilesystemConfiguration,
     LoadPackageInfo,
-    TJobState,
+    TPackageJobState,
     LoadStorage,
 )
 from dlt.common.storages import DataItemStorage, FileStorage
 from dlt.common.storages.fsspec_filesystem import FileItem, FileItemDict
+from dlt.common.storages.schema_storage import SchemaStorage
 from dlt.common.typing import StrAny, TDataItems
 from dlt.common.utils import uniq_id
+
+from tests.common.utils import load_yml_case
+
+TEST_SAMPLE_FILES = "tests/common/storages/samples"
+MINIMALLY_EXPECTED_RELATIVE_PATHS = {
+    "csv/freshman_kgs.csv",
+    "csv/freshman_lbs.csv",
+    "csv/mlb_players.csv",
+    "csv/mlb_teams_2012.csv",
+    "jsonl/mlb_players.jsonl",
+    "met_csv/A801/A881_20230920.csv",
+    "met_csv/A803/A803_20230919.csv",
+    "met_csv/A803/A803_20230920.csv",
+    "parquet/mlb_players.parquet",
+    "gzip/taxi.csv.gz",
+    "sample.txt",
+}
 
 
 @pytest.fixture
@@ -30,46 +50,56 @@ def load_storage() -> LoadStorage:
     return s
 
 
+def glob_local_case(glob_filter: str) -> List[str]:
+    all_files = [
+        os.path.relpath(p, TEST_SAMPLE_FILES)
+        for p in glob.glob(os.path.join(TEST_SAMPLE_FILES, glob_filter), recursive=True)
+        if os.path.isfile(p)
+    ]
+    return [Path(p).as_posix() for p in all_files]
+
+
 def assert_sample_files(
     all_file_items: List[FileItem],
     filesystem: AbstractFileSystem,
     config: FilesystemConfiguration,
     load_content: bool,
+    glob_filter: str = "**",
 ) -> None:
-    minimally_expected_file_items = {
-        "csv/freshman_kgs.csv",
-        "csv/freshman_lbs.csv",
-        "csv/mlb_players.csv",
-        "csv/mlb_teams_2012.csv",
-        "jsonl/mlb_players.jsonl",
-        "met_csv/A801/A881_20230920.csv",
-        "met_csv/A803/A803_20230919.csv",
-        "met_csv/A803/A803_20230920.csv",
-        "parquet/mlb_players.parquet",
-        "gzip/taxi.csv.gz",
-        "sample.txt",
-    }
-    assert len(all_file_items) == len(minimally_expected_file_items)
+    # sanity checks: all expected files are in the fixtures
+    assert MINIMALLY_EXPECTED_RELATIVE_PATHS == set(glob_local_case("**"))
+    # filter expected files by glob filter
+    expected_relative_paths = glob_local_case(glob_filter)
+    expected_file_names = [path.split("/")[-1] for path in expected_relative_paths]
+
+    assert len(all_file_items) == len(expected_relative_paths)
 
     for item in all_file_items:
         # only accept file items we know
-        assert item["file_name"] in minimally_expected_file_items
+        assert item["relative_path"] in expected_relative_paths
 
         # is valid url
         file_url_parsed = urlparse(item["file_url"])
         assert isinstance(item["file_name"], str)
+        assert item["file_name"] in expected_file_names
         assert file_url_parsed.path.endswith(item["file_name"])
         assert item["file_url"].startswith(config.protocol)
+        assert item["file_url"].endswith(item["relative_path"])
         assert isinstance(item["mime_type"], str)
         assert isinstance(item["size_in_bytes"], int)
         assert isinstance(item["modification_date"], pendulum.DateTime)
-        content = filesystem.read_bytes(item["file_url"])
-        assert len(content) == item["size_in_bytes"]
-        if load_content:
-            item["file_content"] = content
 
         # create file dict
         file_dict = FileItemDict(item, config.credentials)
+
+        try:
+            # try to load using local filesystem
+            content = filesystem.read_bytes(file_dict.local_file_path)
+        except ValueError:
+            content = filesystem.read_bytes(file_dict["file_url"])
+        assert len(content) == item["size_in_bytes"]
+        if load_content:
+            item["file_content"] = content
         dict_content = file_dict.read_bytes()
         assert content == dict_content
         with file_dict.open() as f:
@@ -127,32 +157,45 @@ def write_temp_job_file(
     return Path(file_name).name
 
 
-def start_loading_file(
-    s: LoadStorage, content: Sequence[StrAny], start_job: bool = True
-) -> Tuple[str, str]:
+def start_loading_files(
+    s: LoadStorage, content: Sequence[StrAny], start_job: bool = True, file_count: int = 1
+) -> Tuple[str, List[str]]:
     load_id = uniq_id()
     s.new_packages.create_package(load_id)
     # write test file
-    item_storage = s.create_item_storage(DataWriter.writer_spec_from_file_format("jsonl", "object"))
-    file_name = write_temp_job_file(
-        item_storage, s.storage, load_id, "mock_table", None, uniq_id(), content
-    )
+    file_names: List[str] = []
+    for _ in range(0, file_count):
+        item_storage = s.create_item_storage(
+            DataWriter.writer_spec_from_file_format("jsonl", "object")
+        )
+        file_name = write_temp_job_file(
+            item_storage, s.storage, load_id, "mock_table", None, uniq_id(), content
+        )
+        file_names.append(file_name)
     # write schema and schema update
     s.new_packages.save_schema(load_id, Schema("mock"))
     s.new_packages.save_schema_updates(load_id, {})
     s.commit_new_load_package(load_id)
-    assert_package_info(s, load_id, "normalized", "new_jobs")
+    assert_package_info(s, load_id, "normalized", "new_jobs", jobs_count=file_count)
     if start_job:
-        s.normalized_packages.start_job(load_id, file_name)
-        assert_package_info(s, load_id, "normalized", "started_jobs")
-    return load_id, file_name
+        for file_name in file_names:
+            s.normalized_packages.start_job(load_id, file_name)
+            assert_package_info(s, load_id, "normalized", "started_jobs")
+    return load_id, file_names
+
+
+def start_loading_file(
+    s: LoadStorage, content: Sequence[StrAny], start_job: bool = True
+) -> Tuple[str, str]:
+    load_id, file_names = start_loading_files(s, content, start_job)
+    return load_id, file_names[0]
 
 
 def assert_package_info(
     storage: LoadStorage,
     load_id: str,
     package_state: str,
-    job_state: TJobState,
+    job_state: TPackageJobState,
     jobs_count: int = 1,
 ) -> LoadPackageInfo:
     package_info = storage.get_load_package_info(load_id)
@@ -172,3 +215,12 @@ def assert_package_info(
     # get dict
     package_info.asdict()
     return package_info
+
+
+def prepare_eth_import_folder(storage: SchemaStorage) -> Schema:
+    eth_V9 = load_yml_case("schemas/eth/ethereum_schema_v9")
+    # remove processing hints before installing as import schema
+    # ethereum schema is a "dirty" schema with processing hints
+    eth = Schema.from_dict(eth_V9, remove_processing_hints=True)
+    storage._export_schema(eth, storage.config.import_schema_path)
+    return eth

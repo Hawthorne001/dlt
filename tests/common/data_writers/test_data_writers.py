@@ -5,13 +5,12 @@ from typing import Iterator
 
 from dlt.common import pendulum, json
 from dlt.common.data_writers.exceptions import DataWriterNotFound, SpecLookupFailed
+from dlt.common.metrics import DataWriterMetrics
 from dlt.common.typing import AnyFun
 
-# from dlt.destinations.postgres import capabilities
-from dlt.destinations.impl.redshift import capabilities as redshift_caps
 from dlt.common.data_writers.escape import (
     escape_redshift_identifier,
-    escape_bigquery_identifier,
+    escape_hive_identifier,
     escape_redshift_literal,
     escape_postgres_literal,
     escape_duckdb_literal,
@@ -27,10 +26,11 @@ from dlt.common.data_writers.writers import (
     ArrowToTypedJsonlListWriter,
     CsvWriter,
     DataWriter,
-    DataWriterMetrics,
     EMPTY_DATA_WRITER_METRICS,
+    ImportFileWriter,
     InsertValuesWriter,
     JsonlWriter,
+    create_import_spec,
     get_best_writer_spec,
     resolve_best_writer_spec,
     is_native_writer,
@@ -51,8 +51,10 @@ class _BytesIOWriter(DataWriter):
 
 @pytest.fixture
 def insert_writer() -> Iterator[DataWriter]:
+    from dlt.destinations import redshift
+
     with io.StringIO() as f:
-        yield InsertValuesWriter(f, caps=redshift_caps())
+        yield InsertValuesWriter(f, caps=redshift().capabilities())
 
 
 @pytest.fixture
@@ -129,9 +131,9 @@ def test_string_literal_escape() -> None:
 
 
 @pytest.mark.parametrize("escaper", ALL_LITERAL_ESCAPE)
-def test_string_complex_escape(escaper: AnyFun) -> None:
+def test_string_nested_escape(escaper: AnyFun) -> None:
     doc = {
-        "complex": [1, 2, 3, "a"],
+        "nested": [1, 2, 3, "a"],
         "link": (
             "?commen\ntU\nrn=urn%3Ali%3Acomment%3A%28acti\0xA \0x0"
             " \\vity%3A69'08444473\n\n551163392%2C6n \r \x8e9085"
@@ -154,7 +156,7 @@ def test_identifier_escape() -> None:
 
 def test_identifier_escape_bigquery() -> None:
     assert (
-        escape_bigquery_identifier(", NULL'); DROP TABLE\"` -\\-")
+        escape_hive_identifier(", NULL'); DROP TABLE\"` -\\-")
         == "`, NULL'); DROP TABLE\"\\` -\\\\-`"
     )
 
@@ -178,12 +180,13 @@ def test_data_writer_metrics_add() -> None:
     metrics = DataWriterMetrics("file", 10, 100, now, now + 10)
     add_m: DataWriterMetrics = metrics + EMPTY_DATA_WRITER_METRICS  # type: ignore[assignment]
     assert add_m == DataWriterMetrics("", 10, 100, now, now + 10)
-    assert metrics + metrics == DataWriterMetrics("", 20, 200, now, now + 10)
+    # will keep "file" because it is in both
+    assert metrics + metrics == DataWriterMetrics("file", 20, 200, now, now + 10)
     assert sum((metrics, metrics, metrics), EMPTY_DATA_WRITER_METRICS) == DataWriterMetrics(
         "", 30, 300, now, now + 10
     )
     # time range extends when added
-    add_m = metrics + DataWriterMetrics("file", 99, 120, now - 10, now + 20)  # type: ignore[assignment]
+    add_m = metrics + DataWriterMetrics("fileX", 99, 120, now - 10, now + 20)  # type: ignore[assignment]
     assert add_m == DataWriterMetrics("", 109, 220, now - 10, now + 20)
 
 
@@ -259,3 +262,14 @@ def test_get_best_writer() -> None:
     assert WRITER_SPECS[get_best_writer_spec("arrow", "insert_values")] == ArrowToInsertValuesWriter
     with pytest.raises(DataWriterNotFound):
         get_best_writer_spec("arrow", "tsv")  # type: ignore
+
+
+def test_import_file_writer() -> None:
+    spec = create_import_spec("jsonl", ["jsonl"])
+    assert spec.data_item_format == "file"
+    assert spec.file_format == "jsonl"
+    writer = DataWriter.writer_class_from_spec(spec)
+    assert writer is ImportFileWriter
+    w_ = writer(None)
+    with pytest.raises(NotImplementedError):
+        w_.write_header(None)

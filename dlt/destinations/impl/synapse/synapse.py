@@ -1,40 +1,43 @@
 import os
-from typing import ClassVar, Sequence, List, Dict, Any, Optional, cast
+from typing import Sequence, List, Dict, Any, Optional, cast, Union
 from copy import deepcopy
 from textwrap import dedent
 from urllib.parse import urlparse, urlunparse
 
-from dlt import current
-
 from dlt.common.destination import DestinationCapabilitiesContext
 from dlt.common.destination.reference import (
+    PreparedTableSchema,
     SupportsStagingDestination,
-    NewLoadJob,
+    FollowupJobRequest,
+    LoadJob,
 )
 
-from dlt.common.schema import TTableSchema, TColumnSchema, Schema, TColumnHint
+from dlt.common.schema import TColumnSchema, Schema, TColumnHint
 from dlt.common.schema.utils import (
     table_schema_has_type,
     get_inherited_table_hint,
-    is_complete_column,
 )
 
-from dlt.common.configuration.specs import AzureCredentialsWithoutDefaults
+from dlt.common.configuration.exceptions import ConfigurationException
+from dlt.common.configuration.specs import (
+    AzureCredentialsWithoutDefaults,
+    AzureServicePrincipalCredentialsWithoutDefaults,
+)
 
-from dlt.destinations.job_impl import NewReferenceJob
-from dlt.destinations.sql_jobs import SqlStagingCopyJob, SqlJobParams
+from dlt.destinations.impl.mssql.factory import MsSqlTypeMapper
+from dlt.destinations.job_impl import ReferenceFollowupJobRequest
 from dlt.destinations.sql_client import SqlClientBase
-from dlt.destinations.job_client_impl import SqlJobClientBase, LoadJob, CopyRemoteFileLoadJob
-from dlt.destinations.exceptions import LoadJobTerminalException
+from dlt.destinations.job_client_impl import (
+    SqlJobClientBase,
+    CopyRemoteFileLoadJob,
+)
 
 from dlt.destinations.impl.mssql.mssql import (
-    MsSqlTypeMapper,
-    MsSqlClient,
+    MsSqlJobClient,
     VARCHAR_MAX_N,
     VARBINARY_MAX_N,
 )
 
-from dlt.destinations.impl.synapse import capabilities
 from dlt.destinations.impl.synapse.sql_client import SynapseSqlClient
 from dlt.destinations.impl.synapse.configuration import SynapseClientConfiguration
 from dlt.destinations.impl.synapse.synapse_adapter import (
@@ -53,14 +56,20 @@ TABLE_INDEX_TYPE_TO_SYNAPSE_ATTR: Dict[TTableIndexType, str] = {
 }
 
 
-class SynapseClient(MsSqlClient, SupportsStagingDestination):
-    capabilities: ClassVar[DestinationCapabilitiesContext] = capabilities()
-
-    def __init__(self, schema: Schema, config: SynapseClientConfiguration) -> None:
-        super().__init__(schema, config)
+class SynapseClient(MsSqlJobClient, SupportsStagingDestination):
+    def __init__(
+        self,
+        schema: Schema,
+        config: SynapseClientConfiguration,
+        capabilities: DestinationCapabilitiesContext,
+    ) -> None:
+        super().__init__(schema, config, capabilities)
         self.config: SynapseClientConfiguration = config
         self.sql_client = SynapseSqlClient(
-            config.normalize_dataset_name(schema), config.credentials
+            config.normalize_dataset_name(schema),
+            config.normalize_staging_dataset_name(schema),
+            config.credentials,
+            capabilities,
         )
 
         self.active_hints = deepcopy(HINT_TO_SYNAPSE_ATTR)
@@ -71,10 +80,16 @@ class SynapseClient(MsSqlClient, SupportsStagingDestination):
     def _get_table_update_sql(
         self, table_name: str, new_columns: Sequence[TColumnSchema], generate_alter: bool
     ) -> List[str]:
-        table = self.prepare_load_table(table_name, staging=self.in_staging_mode)
+        table = self.prepare_load_table(table_name)
+        if self.in_staging_dataset_mode and self.config.replace_strategy == "insert-from-staging":
+            # Staging tables should always be heap tables, because "when you are
+            # temporarily landing data in dedicated SQL pool, you may find that
+            # using a heap table makes the overall process faster."
+            table[TABLE_INDEX_TYPE_HINT] = "heap"  # type: ignore[typeddict-unknown-key]
+
         table_index_type = cast(TTableIndexType, table.get(TABLE_INDEX_TYPE_HINT))
-        if self.in_staging_mode:
-            final_table = self.prepare_load_table(table_name, staging=False)
+        if self.in_staging_dataset_mode:
+            final_table = self.prepare_load_table(table_name)
             final_table_index_type = cast(TTableIndexType, final_table.get(TABLE_INDEX_TYPE_HINT))
         else:
             final_table_index_type = table_index_type
@@ -125,18 +140,13 @@ class SynapseClient(MsSqlClient, SupportsStagingDestination):
         return c
 
     def _create_replace_followup_jobs(
-        self, table_chain: Sequence[TTableSchema]
-    ) -> List[NewLoadJob]:
+        self, table_chain: Sequence[PreparedTableSchema]
+    ) -> List[FollowupJobRequest]:
         return SqlJobClientBase._create_replace_followup_jobs(self, table_chain)
 
-    def prepare_load_table(self, table_name: str, staging: bool = False) -> TTableSchema:
-        table = super().prepare_load_table(table_name, staging)
-        if staging and self.config.replace_strategy == "insert-from-staging":
-            # Staging tables should always be heap tables, because "when you are
-            # temporarily landing data in dedicated SQL pool, you may find that
-            # using a heap table makes the overall process faster."
-            table[TABLE_INDEX_TYPE_HINT] = "heap"  # type: ignore[typeddict-unknown-key]
-        elif table_name in self.schema.dlt_table_names():
+    def prepare_load_table(self, table_name: str) -> PreparedTableSchema:
+        table = super().prepare_load_table(table_name)
+        if table_name in self.schema.dlt_table_names():
             # dlt tables should always be heap tables, because "for small lookup
             # tables, less than 60 million rows, consider using HEAP or clustered
             # index for faster query performance."
@@ -153,47 +163,42 @@ class SynapseClient(MsSqlClient, SupportsStagingDestination):
             table[TABLE_INDEX_TYPE_HINT] = self.config.default_table_index_type  # type: ignore[typeddict-unknown-key]
         return table
 
-    def start_file_load(self, table: TTableSchema, file_path: str, load_id: str) -> LoadJob:
-        job = super().start_file_load(table, file_path, load_id)
+    def create_load_job(
+        self, table: PreparedTableSchema, file_path: str, load_id: str, restore: bool = False
+    ) -> LoadJob:
+        job = super().create_load_job(table, file_path, load_id, restore)
         if not job:
-            assert NewReferenceJob.is_reference_job(
+            assert ReferenceFollowupJobRequest.is_reference_job(
                 file_path
             ), "Synapse must use staging to load files"
             job = SynapseCopyFileLoadJob(
-                table,
                 file_path,
-                self.sql_client,
-                cast(AzureCredentialsWithoutDefaults, self.config.staging_config.credentials),
+                self.config.staging_config.credentials,  # type: ignore[arg-type]
                 self.config.staging_use_msi,
             )
         return job
+
+    def should_truncate_table_before_load_on_staging_destination(self, table_name: str) -> bool:
+        return self.config.truncate_tables_on_staging_destination_before_load
 
 
 class SynapseCopyFileLoadJob(CopyRemoteFileLoadJob):
     def __init__(
         self,
-        table: TTableSchema,
         file_path: str,
-        sql_client: SqlClientBase[Any],
-        staging_credentials: Optional[AzureCredentialsWithoutDefaults] = None,
+        staging_credentials: Optional[
+            Union[AzureCredentialsWithoutDefaults, AzureServicePrincipalCredentialsWithoutDefaults]
+        ] = None,
         staging_use_msi: bool = False,
     ) -> None:
         self.staging_use_msi = staging_use_msi
-        super().__init__(table, file_path, sql_client, staging_credentials)
+        super().__init__(file_path, staging_credentials)
 
-    def execute(self, table: TTableSchema, bucket_path: str) -> None:
+    def run(self) -> None:
+        self._sql_client = self._job_client.sql_client
         # get format
-        ext = os.path.splitext(bucket_path)[1][1:]
+        ext = os.path.splitext(self._bucket_path)[1][1:]
         if ext == "parquet":
-            if table_schema_has_type(table, "time"):
-                # Synapse interprets Parquet TIME columns as bigint, resulting in
-                # an incompatibility error.
-                raise LoadJobTerminalException(
-                    self.file_name(),
-                    "Synapse cannot load TIME columns from Parquet files. Switch to direct INSERT"
-                    " file format or convert `datetime.time` objects in your data to `str` or"
-                    " `datetime.datetime`",
-                )
             file_type = "PARQUET"
 
             # dlt-generated DDL statements will still create the table, but
@@ -204,16 +209,32 @@ class SynapseCopyFileLoadJob(CopyRemoteFileLoadJob):
 
         staging_credentials = self._staging_credentials
         assert staging_credentials is not None
-        assert isinstance(staging_credentials, AzureCredentialsWithoutDefaults)
+        assert isinstance(
+            staging_credentials,
+            (AzureCredentialsWithoutDefaults, AzureServicePrincipalCredentialsWithoutDefaults),
+        )
         azure_storage_account_name = staging_credentials.azure_storage_account_name
-        https_path = self._get_https_path(bucket_path, azure_storage_account_name)
-        table_name = table["name"]
+        https_path = self._get_https_path(self._bucket_path, azure_storage_account_name)
+        table_name = self._load_table["name"]
 
         if self.staging_use_msi:
             credential = "IDENTITY = 'Managed Identity'"
         else:
-            sas_token = staging_credentials.azure_storage_sas_token
-            credential = f"IDENTITY = 'Shared Access Signature', SECRET = '{sas_token}'"
+            # re-use staging credentials for copy into Synapse
+            if isinstance(staging_credentials, AzureCredentialsWithoutDefaults):
+                sas_token = staging_credentials.azure_storage_sas_token
+                credential = f"IDENTITY = 'Shared Access Signature', SECRET = '{sas_token}'"
+            elif isinstance(staging_credentials, AzureServicePrincipalCredentialsWithoutDefaults):
+                tenant_id = staging_credentials.azure_tenant_id
+                endpoint = f"https://login.microsoftonline.com/{tenant_id}/oauth2/token"
+                identity = f"{staging_credentials.azure_client_id}@{endpoint}"
+                secret = staging_credentials.azure_client_secret
+                credential = f"IDENTITY = '{identity}', SECRET = '{secret}'"
+            else:
+                raise ConfigurationException(
+                    f"Credentials of type `{type(staging_credentials)}` not supported"
+                    " when loading data from staging into Synapse using `COPY INTO`."
+                )
 
         # Copy data from staging file into Synapse table.
         with self._sql_client.begin_transaction():
@@ -228,10 +249,6 @@ class SynapseCopyFileLoadJob(CopyRemoteFileLoadJob):
                 )
             """)
             self._sql_client.execute_sql(sql)
-
-    def exception(self) -> str:
-        # this part of code should be never reached
-        raise NotImplementedError()
 
     def _get_https_path(self, bucket_path: str, storage_account_name: str) -> str:
         """

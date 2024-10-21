@@ -6,13 +6,18 @@ from unittest.mock import patch
 
 from dlt.common import json, pendulum
 from dlt.common.configuration.resolve import resolve_configuration
+from dlt.common.schema.schema import Schema
 from dlt.common.schema.typing import VERSION_TABLE_NAME
 from dlt.common.storages import FileStorage
 from dlt.common.storages.schema_storage import SchemaStorage
 from dlt.common.utils import uniq_id
 
 from dlt.destinations.exceptions import DatabaseTerminalException
-from dlt.destinations.impl.redshift.configuration import RedshiftCredentials
+from dlt.destinations import redshift
+from dlt.destinations.impl.redshift.configuration import (
+    RedshiftCredentials,
+    RedshiftClientConfiguration,
+)
 from dlt.destinations.impl.redshift.redshift import RedshiftClient, psycopg2
 
 from tests.common.utils import COMMON_TEST_CASES_PATH
@@ -42,6 +47,34 @@ def test_postgres_and_redshift_credentials_defaults() -> None:
     assert red_cred.port == 5439
 
 
+def test_redshift_factory() -> None:
+    schema = Schema("schema")
+    dest = redshift()
+    client = dest.client(schema, RedshiftClientConfiguration()._bind_dataset_name("dataset"))
+    assert client.config.staging_iam_role is None
+    assert client.config.has_case_sensitive_identifiers is False
+    assert client.capabilities.has_case_sensitive_identifiers is False
+    assert client.capabilities.casefold_identifier is str.lower
+
+    # set args explicitly
+    dest = redshift(has_case_sensitive_identifiers=True, staging_iam_role="LOADER")
+    client = dest.client(schema, RedshiftClientConfiguration()._bind_dataset_name("dataset"))
+    assert client.config.staging_iam_role == "LOADER"
+    assert client.config.has_case_sensitive_identifiers is True
+    assert client.capabilities.has_case_sensitive_identifiers is True
+    assert client.capabilities.casefold_identifier is str
+
+    # set args via config
+    os.environ["DESTINATION__STAGING_IAM_ROLE"] = "LOADER"
+    os.environ["DESTINATION__HAS_CASE_SENSITIVE_IDENTIFIERS"] = "True"
+    dest = redshift()
+    client = dest.client(schema, RedshiftClientConfiguration()._bind_dataset_name("dataset"))
+    assert client.config.staging_iam_role == "LOADER"
+    assert client.config.has_case_sensitive_identifiers is True
+    assert client.capabilities.has_case_sensitive_identifiers is True
+    assert client.capabilities.casefold_identifier is str
+
+
 @skipifpypy
 def test_text_too_long(client: RedshiftClient, file_storage: FileStorage) -> None:
     caps = client.capabilities
@@ -57,9 +90,10 @@ def test_text_too_long(client: RedshiftClient, file_storage: FileStorage) -> Non
     # print(len(max_len_str_b))
     row_id = uniq_id()
     insert_values = f"('{row_id}', '{uniq_id()}', '{max_len_str}' , '{str(pendulum.now())}');"
-    with pytest.raises(DatabaseTerminalException) as exv:
-        expect_load_file(client, file_storage, insert_sql + insert_values, user_table_name)
-    assert type(exv.value.dbapi_exception) is psycopg2.errors.StringDataRightTruncation
+    job = expect_load_file(
+        client, file_storage, insert_sql + insert_values, user_table_name, "failed"
+    )
+    assert type(job._exception.dbapi_exception) is psycopg2.errors.StringDataRightTruncation  # type: ignore
 
 
 def test_wei_value(client: RedshiftClient, file_storage: FileStorage) -> None:
@@ -74,9 +108,10 @@ def test_wei_value(client: RedshiftClient, file_storage: FileStorage) -> None:
         f"('{uniq_id()}', '{uniq_id()}', '90238094809sajlkjxoiewjhduuiuehd',"
         f" '{str(pendulum.now())}', {10**38});"
     )
-    with pytest.raises(DatabaseTerminalException) as exv:
-        expect_load_file(client, file_storage, insert_sql + insert_values, user_table_name)
-    assert type(exv.value.dbapi_exception) is psycopg2.errors.InternalError_
+    job = expect_load_file(
+        client, file_storage, insert_sql + insert_values, user_table_name, "failed"
+    )
+    assert type(job._exception.dbapi_exception) is psycopg2.errors.InternalError_  # type: ignore
 
 
 def test_schema_string_exceeds_max_text_length(client: RedshiftClient) -> None:
@@ -88,7 +123,7 @@ def test_schema_string_exceeds_max_text_length(client: RedshiftClient) -> None:
     schema_str = json.dumps(schema.to_dict())
     assert len(schema_str.encode("utf-8")) > client.capabilities.max_text_data_type_length
     client._update_schema_in_storage(schema)
-    schema_info = client.get_stored_schema()
+    schema_info = client.get_stored_schema(client.schema.name)
     assert schema_info.schema == schema_str
     # take base64 from db
     with client.sql_client.execute_query(

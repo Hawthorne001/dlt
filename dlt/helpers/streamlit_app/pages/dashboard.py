@@ -17,7 +17,7 @@ def write_data_explorer_page(
 ) -> None:
     """Writes Streamlit app page with a schema and live data preview.
 
-    #### Args:
+    Args:
         pipeline (Pipeline): Pipeline instance to use.
         schema_name (str, optional): Name of the schema to display. If None, default schema is used.
         example_query (str, optional): Example query to be displayed in the SQL Query box.
@@ -29,7 +29,8 @@ def write_data_explorer_page(
 
     st.subheader("Schemas and tables", divider="rainbow")
     schema_picker(pipeline)
-    if schema := st.session_state["schema"]:
+    if schema_name := st.session_state.get("schema_name"):
+        schema = pipeline.schemas.get(schema_name)
         tables = sorted(
             schema.data_tables(),
             key=lambda table: table["name"],

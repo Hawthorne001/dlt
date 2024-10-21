@@ -1,5 +1,6 @@
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, cast
 
+from dlt.common.utils import without_none
 from dlt.common.exceptions import MissingDependencyException
 from dlt.common.typing import TSecretStrValue, DictStrAny
 from dlt.common.configuration.specs import (
@@ -7,7 +8,10 @@ from dlt.common.configuration.specs import (
     CredentialsWithDefault,
     configspec,
 )
-from dlt.common.configuration.specs.exceptions import InvalidBoto3Session
+from dlt.common.configuration.specs.exceptions import (
+    InvalidBoto3Session,
+    ObjectStoreRsCredentialsException,
+)
 from dlt import version
 
 
@@ -44,6 +48,32 @@ class AwsCredentialsWithoutDefaults(CredentialsConfiguration):
             aws_secret_access_key=self.aws_secret_access_key,
             aws_session_token=self.aws_session_token,
         )
+
+    def to_object_store_rs_credentials(self) -> Dict[str, str]:
+        # https://docs.rs/object_store/latest/object_store/aws
+        creds = cast(
+            Dict[str, str],
+            without_none(
+                dict(
+                    aws_access_key_id=self.aws_access_key_id,
+                    aws_secret_access_key=self.aws_secret_access_key,
+                    aws_session_token=self.aws_session_token,
+                    region=self.region_name,
+                    endpoint_url=self.endpoint_url,
+                )
+            ),
+        )
+
+        if "endpoint_url" not in creds:  # AWS S3
+            if "region" not in creds:
+                raise ObjectStoreRsCredentialsException(
+                    "`object_store` Rust crate requires AWS region when using AWS S3."
+                )
+        else:  # S3-compatible, e.g. MinIO
+            if self.endpoint_url.startswith("http://"):
+                creds["aws_allow_http"] = "true"
+
+        return creds
 
 
 @configspec

@@ -24,7 +24,7 @@ from dlt.common.configuration.specs import (
 )
 from dlt.common.configuration.container import Container
 from dlt.common.exceptions import PipelineException
-from dlt.common.source import unset_current_pipe_name, set_current_pipe_name
+from dlt.common.pipeline import unset_current_pipe_name, set_current_pipe_name
 from dlt.common.utils import get_callable_name
 
 from dlt.extract.exceptions import (
@@ -51,8 +51,7 @@ class PipeIterator(Iterator[PipeItem]):
         workers: int = 5
         futures_poll_interval: float = 0.01
         copy_on_fork: bool = False
-        next_item_mode: str = "fifo"
-
+        next_item_mode: str = "round_robin"
         __section__: ClassVar[str] = known_sections.EXTRACT
 
     def __init__(
@@ -82,7 +81,7 @@ class PipeIterator(Iterator[PipeItem]):
         max_parallel_items: int = 20,
         workers: int = 5,
         futures_poll_interval: float = 0.01,
-        next_item_mode: TPipeNextItemMode = "fifo",
+        next_item_mode: TPipeNextItemMode = "round_robin",
     ) -> "PipeIterator":
         # join all dependent pipes
         if pipe.parent:
@@ -109,7 +108,7 @@ class PipeIterator(Iterator[PipeItem]):
         workers: int = 5,
         futures_poll_interval: float = 0.01,
         copy_on_fork: bool = False,
-        next_item_mode: TPipeNextItemMode = "fifo",
+        next_item_mode: TPipeNextItemMode = "round_robin",
     ) -> "PipeIterator":
         # print(f"max_parallel_items: {max_parallel_items} workers: {workers}")
         sources: List[SourcePipeItem] = []

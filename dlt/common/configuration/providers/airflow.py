@@ -1,10 +1,10 @@
 import io
 import contextlib
 
-from .toml import VaultTomlProvider
+from .vault import VaultDocProvider
 
 
-class AirflowSecretsTomlProvider(VaultTomlProvider):
+class AirflowSecretsTomlProvider(VaultDocProvider):
     def __init__(self, only_secrets: bool = False, only_toml_fragments: bool = False) -> None:
         super().__init__(only_secrets, only_toml_fragments)
 
@@ -14,7 +14,6 @@ class AirflowSecretsTomlProvider(VaultTomlProvider):
 
     def _look_vault(self, full_key: str, hint: type) -> str:
         """Get Airflow Variable with given `full_key`, return None if not found"""
-
         from airflow.models import Variable
 
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):

@@ -1,5 +1,5 @@
 from contextlib import contextmanager, suppress
-from typing import Any, AnyStr, ClassVar, Iterator, Optional, Sequence, List
+from typing import Any, AnyStr, ClassVar, Dict, Iterator, Optional, Sequence, List
 
 import snowflake.connector as snowflake_lib
 
@@ -12,12 +12,13 @@ from dlt.destinations.exceptions import (
 from dlt.destinations.sql_client import (
     DBApiCursorImpl,
     SqlClientBase,
+    TJobQueryTags,
     raise_database_error,
     raise_open_connection_error,
 )
-from dlt.destinations.typing import DBApi, DBApiCursor, DBTransaction, DataFrame
+from dlt.destinations.typing import DBApi, DBTransaction, DataFrame
 from dlt.destinations.impl.snowflake.configuration import SnowflakeCredentials
-from dlt.destinations.impl.snowflake import capabilities
+from dlt.common.destination.reference import DBApiCursor
 
 
 class SnowflakeCursorImpl(DBApiCursorImpl):
@@ -31,12 +32,19 @@ class SnowflakeCursorImpl(DBApiCursorImpl):
 
 class SnowflakeSqlClient(SqlClientBase[snowflake_lib.SnowflakeConnection], DBTransaction):
     dbapi: ClassVar[DBApi] = snowflake_lib
-    capabilities: ClassVar[DestinationCapabilitiesContext] = capabilities()
 
-    def __init__(self, dataset_name: str, credentials: SnowflakeCredentials) -> None:
-        super().__init__(credentials.database, dataset_name)
+    def __init__(
+        self,
+        dataset_name: str,
+        staging_dataset_name: str,
+        credentials: SnowflakeCredentials,
+        capabilities: DestinationCapabilitiesContext,
+        query_tag: Optional[str] = None,
+    ) -> None:
+        super().__init__(credentials.database, dataset_name, staging_dataset_name, capabilities)
         self._conn: snowflake_lib.SnowflakeConnection = None
         self.credentials = credentials
+        self.query_tag = query_tag
 
     def open_connection(self) -> snowflake_lib.SnowflakeConnection:
         conn_params = self.credentials.to_connector_params()
@@ -112,15 +120,23 @@ class SnowflakeSqlClient(SqlClientBase[snowflake_lib.SnowflakeConnection], DBTra
                     self.open_connection()
                 raise outer
 
-    def fully_qualified_dataset_name(self, escape: bool = True) -> str:
-        # Always escape for uppercase
-        if escape:
-            return self.capabilities.escape_identifier(self.dataset_name)
-        return self.dataset_name.upper()
-
     def _reset_connection(self) -> None:
         self._conn.rollback()
         self._conn.autocommit(True)
+
+    def set_query_tags(self, tags: TJobQueryTags) -> None:
+        super().set_query_tags(tags)
+        if self.query_tag:
+            self._tag_session()
+
+    def _tag_session(self) -> None:
+        """Wraps query with Snowflake query tag"""
+        if self._query_tags:
+            tag = self.query_tag.format(**self._query_tags)
+            tag_query = f"ALTER SESSION SET QUERY_TAG = '{tag}'"
+        else:
+            tag_query = "ALTER SESSION UNSET QUERY_TAG"
+        self.execute_sql(tag_query)
 
     @classmethod
     def _make_database_exception(cls, ex: Exception) -> Exception:
@@ -148,11 +164,7 @@ class SnowflakeSqlClient(SqlClientBase[snowflake_lib.SnowflakeConnection], DBTra
         elif isinstance(ex, snowflake_lib.errors.IntegrityError):
             raise DatabaseTerminalException(ex)
         elif isinstance(ex, snowflake_lib.errors.DatabaseError):
-            term = cls._maybe_make_terminal_exception_from_data_error(ex)
-            if term:
-                return term
-            else:
-                return DatabaseTransientException(ex)
+            return DatabaseTransientException(ex)
         elif isinstance(ex, TypeError):
             # snowflake raises TypeError on malformed query parameters
             return DatabaseTransientException(snowflake_lib.errors.ProgrammingError(str(ex)))
@@ -160,12 +172,6 @@ class SnowflakeSqlClient(SqlClientBase[snowflake_lib.SnowflakeConnection], DBTra
             return DatabaseTransientException(ex)
         else:
             return ex
-
-    @staticmethod
-    def _maybe_make_terminal_exception_from_data_error(
-        snowflake_ex: snowflake_lib.DatabaseError,
-    ) -> Optional[Exception]:
-        return None
 
     @staticmethod
     def is_dbapi_exception(ex: Exception) -> bool:

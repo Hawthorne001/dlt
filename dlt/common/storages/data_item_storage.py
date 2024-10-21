@@ -1,14 +1,13 @@
-from pathlib import Path
-from typing import Dict, Any, List, Sequence
+from typing import Dict, Any, List
 from abc import ABC, abstractmethod
 
 from dlt.common import logger
+from dlt.common.metrics import DataWriterMetrics
 from dlt.common.schema import TTableSchemaColumns
-from dlt.common.typing import StrAny, TDataItems
+from dlt.common.typing import TDataItems
 from dlt.common.data_writers import (
     BufferedDataWriter,
     DataWriter,
-    DataWriterMetrics,
     FileWriterSpec,
 )
 
@@ -60,15 +59,18 @@ class DataItemStorage(ABC):
         table_name: str,
         file_path: str,
         metrics: DataWriterMetrics,
+        with_extension: str = None,
     ) -> DataWriterMetrics:
         """Import a file from `file_path` into items storage under a new file name. Does not check
         the imported file format. Uses counts from `metrics` as a base. Logically closes the imported file
 
         The preferred import method is a hard link to avoid copying the data. If current filesystem does not
         support it, a regular copy is used.
+
+        Alternative extension may be provided via `with_extension` so various file formats may be imported into the same folder.
         """
         writer = self._get_writer(load_id, schema_name, table_name)
-        return writer.import_file(file_path, metrics)
+        return writer.import_file(file_path, metrics, with_extension)
 
     def close_writers(self, load_id: str, skip_flush: bool = False) -> None:
         """Flush, write footers (skip_flush), write metrics and close files in all

@@ -1,5 +1,5 @@
 from contextlib import contextmanager
-from typing import Any, AnyStr, ClassVar, Iterator, List, Optional, Sequence
+from typing import Any, AnyStr, ClassVar, Iterator, List, Optional, Sequence, Generator
 
 import google.cloud.bigquery as bigquery  # noqa: I250
 from google.api_core import exceptions as api_core_exceptions
@@ -8,6 +8,7 @@ from google.cloud.bigquery import dbapi as bq_dbapi
 from google.cloud.bigquery.dbapi import Connection as DbApiConnection, Cursor as BQDbApiCursor
 from google.cloud.bigquery.dbapi import exceptions as dbapi_exceptions
 
+from dlt.common import logger
 from dlt.common.configuration.specs import GcpServiceAccountCredentialsWithoutDefaults
 from dlt.common.destination import DestinationCapabilitiesContext
 from dlt.common.typing import StrAny
@@ -16,14 +17,14 @@ from dlt.destinations.exceptions import (
     DatabaseTransientException,
     DatabaseUndefinedRelation,
 )
-from dlt.destinations.impl.bigquery import capabilities
 from dlt.destinations.sql_client import (
     DBApiCursorImpl,
     SqlClientBase,
     raise_database_error,
     raise_open_connection_error,
 )
-from dlt.destinations.typing import DBApi, DBApiCursor, DBTransaction, DataFrame
+from dlt.destinations.typing import DBApi, DBTransaction, DataFrame, ArrowTable
+from dlt.common.destination.reference import DBApiCursor
 
 
 # terminal reasons as returned in BQ gRPC error response
@@ -45,37 +46,36 @@ class BigQueryDBApiCursorImpl(DBApiCursorImpl):
 
     native_cursor: BQDbApiCursor  # type: ignore
 
-    def df(self, chunk_size: int = None, **kwargs: Any) -> DataFrame:
-        if chunk_size is not None:
-            return super().df(chunk_size=chunk_size)
-        query_job: bigquery.QueryJob = getattr(
-            self.native_cursor, "_query_job", self.native_cursor.query_job
-        )
+    def __init__(self, curr: DBApiCursor) -> None:
+        super().__init__(curr)
 
-        try:
-            return query_job.to_dataframe(**kwargs)
-        except ValueError:
-            # no pyarrow/db-types, fallback to our implementation
-            return super().df()
+    def iter_df(self, chunk_size: int) -> Generator[DataFrame, None, None]:
+        yield from self.native_cursor.query_job.result(page_size=chunk_size).to_dataframe_iterable()
+
+    def iter_arrow(self, chunk_size: int) -> Generator[ArrowTable, None, None]:
+        yield from self.native_cursor.query_job.result(page_size=chunk_size).to_arrow_iterable()
 
 
 class BigQuerySqlClient(SqlClientBase[bigquery.Client], DBTransaction):
     dbapi: ClassVar[DBApi] = bq_dbapi
-    capabilities: ClassVar[DestinationCapabilitiesContext] = capabilities()
 
     def __init__(
         self,
         dataset_name: str,
+        staging_dataset_name: str,
         credentials: GcpServiceAccountCredentialsWithoutDefaults,
+        capabilities: DestinationCapabilitiesContext,
         location: str = "US",
+        project_id: Optional[str] = None,
         http_timeout: float = 15.0,
         retry_deadline: float = 60.0,
     ) -> None:
         self._client: bigquery.Client = None
         self.credentials: GcpServiceAccountCredentialsWithoutDefaults = credentials
         self.location = location
+        self.project_id = project_id or self.credentials.project_id
         self.http_timeout = http_timeout
-        super().__init__(credentials.project_id, dataset_name)
+        super().__init__(self.project_id, dataset_name, staging_dataset_name, capabilities)
 
         self._default_retry = bigquery.DEFAULT_RETRY.with_deadline(retry_deadline)
         self._default_query = bigquery.QueryJobConfig(
@@ -86,7 +86,7 @@ class BigQuerySqlClient(SqlClientBase[bigquery.Client], DBTransaction):
     @raise_open_connection_error
     def open_connection(self) -> bigquery.Client:
         self._client = bigquery.Client(
-            self.credentials.project_id,
+            self.project_id,
             credentials=self.credentials.to_native_credentials(),
             location=self.location,
         )
@@ -177,20 +177,24 @@ class BigQuerySqlClient(SqlClientBase[bigquery.Client], DBTransaction):
             return False
 
     def create_dataset(self) -> None:
-        self._client.create_dataset(
-            self.fully_qualified_dataset_name(escape=False),
-            retry=self._default_retry,
-            timeout=self.http_timeout,
-        )
-
-    def drop_dataset(self) -> None:
-        self._client.delete_dataset(
-            self.fully_qualified_dataset_name(escape=False),
-            not_found_ok=True,
-            delete_contents=True,
-            retry=self._default_retry,
-            timeout=self.http_timeout,
-        )
+        dataset = bigquery.Dataset(self.fully_qualified_dataset_name(escape=False))
+        dataset.location = self.location
+        dataset.is_case_insensitive = not self.capabilities.has_case_sensitive_identifiers
+        try:
+            self._client.create_dataset(
+                dataset,
+                retry=self._default_retry,
+                timeout=self.http_timeout,
+            )
+        except api_core_exceptions.GoogleAPICallError as gace:
+            reason = BigQuerySqlClient._get_reason_from_errors(gace)
+            if reason == "notFound":
+                # google.api_core.exceptions.NotFound: 404 – table not found
+                raise DatabaseUndefinedRelation(gace) from gace
+            elif reason in BQ_TERMINAL_REASONS:
+                raise DatabaseTerminalException(gace) from gace
+            else:
+                raise DatabaseTransientException(gace) from gace
 
     def execute_sql(
         self, sql: AnyStr, *args: Any, **kwargs: Any
@@ -221,14 +225,19 @@ class BigQuerySqlClient(SqlClientBase[bigquery.Client], DBTransaction):
                 # will close all cursors
                 conn.close()
 
-    def fully_qualified_dataset_name(self, escape: bool = True) -> str:
+    def catalog_name(self, escape: bool = True) -> Optional[str]:
+        project_id = self.capabilities.casefold_identifier(self.project_id)
         if escape:
-            project_id = self.capabilities.escape_identifier(self.credentials.project_id)
-            dataset_name = self.capabilities.escape_identifier(self.dataset_name)
-        else:
-            project_id = self.credentials.project_id
-            dataset_name = self.dataset_name
-        return f"{project_id}.{dataset_name}"
+            project_id = self.capabilities.escape_identifier(project_id)
+        return project_id
+
+    @property
+    def is_hidden_dataset(self) -> bool:
+        """Tells if the dataset associated with sql_client is a hidden dataset.
+
+        Hidden datasets are not present in information schema.
+        """
+        return self.dataset_name.startswith("_")
 
     @classmethod
     def _make_database_exception(cls, ex: Exception) -> Exception:

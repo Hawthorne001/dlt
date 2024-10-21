@@ -1,5 +1,4 @@
 import copy
-import inspect
 import contextlib
 import dataclasses
 import warnings
@@ -19,6 +18,7 @@ from typing import (
     overload,
     ClassVar,
     TypeVar,
+    Literal,
 )
 from typing_extensions import get_args, get_origin, dataclass_transform
 from functools import wraps
@@ -29,9 +29,17 @@ else:
     TDtcField = dataclasses.Field
 
 from dlt.common.typing import (
+    AnyType,
+    SecretSentinel,
+    ConfigValueSentinel,
     TAnyClass,
+    Annotated,
     extract_inner_type,
+    is_annotated,
+    is_any_type,
+    is_final_type,
     is_optional_type,
+    is_subclass,
     is_union_type,
 )
 from dlt.common.data_types import py_type_to_sc_type
@@ -44,20 +52,47 @@ from dlt.common.configuration.exceptions import (
 # forward class declaration
 _F_BaseConfiguration: Any = type(object)
 _F_ContainerInjectableContext: Any = type(object)
-_T = TypeVar("_T", bound="BaseConfiguration")
-_C = TypeVar("_C", bound="CredentialsConfiguration")
+_B = TypeVar("_B", bound="BaseConfiguration")
+
+
+class NotResolved:
+    """Used in type annotations to indicate types that should not be resolved."""
+
+    def __init__(self, not_resolved: bool = True):
+        self.not_resolved = not_resolved
+
+    def __bool__(self) -> bool:
+        return self.not_resolved
+
+
+def is_hint_not_resolvable(hint: AnyType) -> bool:
+    """Checks if hint should NOT be resolved. Final and types annotated like
+
+    >>> Annotated[str, NotResolved()]
+
+    are not resolved.
+    """
+    if is_final_type(hint):
+        return True
+
+    if is_annotated(hint):
+        _, *a_m = get_args(hint)
+        for annotation in a_m:
+            if isinstance(annotation, NotResolved):
+                return bool(annotation)
+    return False
 
 
 def is_base_configuration_inner_hint(inner_hint: Type[Any]) -> bool:
-    return inspect.isclass(inner_hint) and issubclass(inner_hint, BaseConfiguration)
+    return is_subclass(inner_hint, BaseConfiguration)
 
 
 def is_context_inner_hint(inner_hint: Type[Any]) -> bool:
-    return inspect.isclass(inner_hint) and issubclass(inner_hint, ContainerInjectableContext)
+    return is_subclass(inner_hint, ContainerInjectableContext)
 
 
 def is_credentials_inner_hint(inner_hint: Type[Any]) -> bool:
-    return inspect.isclass(inner_hint) and issubclass(inner_hint, CredentialsConfiguration)
+    return is_subclass(inner_hint, CredentialsConfiguration)
 
 
 def get_config_if_union_hint(hint: Type[Any]) -> Type[Any]:
@@ -70,11 +105,16 @@ def is_valid_hint(hint: Type[Any]) -> bool:
     if get_origin(hint) is ClassVar:
         # class vars are skipped by dataclass
         return True
+
+    if is_hint_not_resolvable(hint):
+        # all hints that are not resolved are valid
+        return True
+
     hint = extract_inner_type(hint)
     hint = get_config_if_union_hint(hint) or hint
     hint = get_origin(hint) or hint
 
-    if hint is Any:
+    if is_any_type(hint):
         return True
     if is_base_configuration_inner_hint(hint):
         return True
@@ -84,23 +124,32 @@ def is_valid_hint(hint: Type[Any]) -> bool:
     return False
 
 
-def extract_inner_hint(hint: Type[Any], preserve_new_types: bool = False) -> Type[Any]:
+def extract_inner_hint(
+    hint: Type[Any],
+    preserve_new_types: bool = False,
+    preserve_literal: bool = False,
+    preserve_annotated: bool = False,
+) -> Type[Any]:
     # extract hint from Optional / Literal / NewType hints
-    inner_hint = extract_inner_type(hint, preserve_new_types)
+    inner_hint = extract_inner_type(hint, preserve_new_types, preserve_literal, preserve_annotated)
     # get base configuration from union type
     inner_hint = get_config_if_union_hint(inner_hint) or inner_hint
     # extract origin from generic types (ie List[str] -> List)
-    return get_origin(inner_hint) or inner_hint
+    origin = get_origin(inner_hint) or inner_hint
+    if preserve_literal and origin is Literal or preserve_annotated and origin is Annotated:
+        return inner_hint
+    return origin or inner_hint
 
 
 def is_secret_hint(hint: Type[Any]) -> bool:
     is_secret = False
-    if hasattr(hint, "__name__"):
-        is_secret = hint.__name__ == "TSecretValue"
+    if is_annotated(hint):
+        _, *a_m = get_args(hint)
+        is_secret = SecretSentinel in a_m
     if not is_secret:
         is_secret = is_credentials_inner_hint(hint)
     if not is_secret:
-        inner_hint = extract_inner_hint(hint, preserve_new_types=True)
+        inner_hint = extract_inner_hint(hint, preserve_annotated=True, preserve_new_types=True)
         # something was encapsulated
         if inner_hint is not hint:
             is_secret = is_secret_hint(inner_hint)
@@ -154,7 +203,7 @@ def configspec(
             if not hasattr(cls, ann) and not ann.startswith(("__", "_abc_")):
                 warnings.warn(
                     f"Missing default value for field {ann} on {cls.__name__}. None assumed. All"
-                    " fields in configspec must have default."
+                    " fields in configspec must have defaults."
                 )
                 setattr(cls, ann, None)
         # get all attributes without corresponding annotations
@@ -177,10 +226,29 @@ def configspec(
                 if att_name not in cls.__annotations__:
                     raise ConfigFieldMissingTypeHintException(att_name, cls)
                 hint = cls.__annotations__[att_name]
+                # resolve the annotation as per PEP 563
+                # NOTE: we do not use get_type_hints because at this moment cls is an unknown name
+                # (ie. used as decorator and module is being imported)
+                if isinstance(hint, str):
+                    hint = eval(hint)
 
                 # context can have any type
                 if not is_valid_hint(hint) and not is_context:
                     raise ConfigFieldTypeHintNotSupported(att_name, cls, hint)
+                # replace config / secret sentinels
+                if isinstance(att_value, ConfigValueSentinel):
+                    if is_secret_hint(att_value.default_type) and not is_secret_hint(hint):
+                        warnings.warn(
+                            f"You indicated {att_name} to be {att_value.default_literal} but type"
+                            " hint is not a secret"
+                        )
+                    if not is_secret_hint(att_value.default_type) and is_secret_hint(hint):
+                        warnings.warn(
+                            f"You typed {att_name} to be a secret but"
+                            f" {att_value.default_literal} indicates it is not"
+                        )
+                    setattr(cls, att_name, None)
+
                 if isinstance(att_value, BaseConfiguration):
                     # Wrap config defaults in default_factory to work around dataclass
                     # blocking mutable defaults
@@ -197,7 +265,7 @@ def configspec(
         synth_init = init and ((not base_params or base_params.init) and has_default_init)
         if synth_init != init and has_default_init:
             warnings.warn(
-                f"__init__ method will not be generated on {cls.__name__} because bas class didn't"
+                f"__init__ method will not be generated on {cls.__name__} because base class didn't"
                 " synthesize __init__. Please correct `init` flag in confispec decorator. You are"
                 " probably receiving incorrect __init__ signature for type checking"
             )
@@ -227,11 +295,38 @@ class BaseConfiguration(MutableMapping[str, Any]):
     """Typing for dataclass fields"""
     __hint_resolvers__: ClassVar[Dict[str, Callable[["BaseConfiguration"], Type[Any]]]] = {}
 
+    @classmethod
+    def from_init_value(cls: Type[_B], init_value: Any = None) -> _B:
+        """Initializes credentials from `init_value`
+
+        Init value may be a native representation of the credentials or a dict. In case of native representation (for example a connection string or JSON with service account credentials)
+        a `parse_native_representation` method will be used to parse it. In case of a dict, the credentials object will be updated with key: values of the dict.
+        Unexpected values in the dict will be ignored.
+
+        Credentials will be marked as resolved if all required fields are set resolve() method is successful
+        """
+        # create an instance
+        self = cls()
+        self._apply_init_value(init_value)
+        if not self.is_partial():
+            # let it fail gracefully
+            with contextlib.suppress(Exception):
+                self.resolve()
+        return self
+
+    def _apply_init_value(self, init_value: Any = None) -> None:
+        if isinstance(init_value, C_Mapping):
+            self.update(init_value)
+        elif init_value is not None:
+            self.parse_native_representation(init_value)
+        else:
+            return
+
     def parse_native_representation(self, native_value: Any) -> None:
         """Initialize the configuration fields by parsing the `native_value` which should be a native representation of the configuration
         or credentials, for example database connection string or JSON serialized GCP service credentials file.
 
-        #### Args:
+        Args:
             native_value (Any): A native representation of the configuration
 
         Raises:
@@ -256,14 +351,17 @@ class BaseConfiguration(MutableMapping[str, Any]):
         """Yields all resolvable dataclass fields in the order they should be resolved"""
         # Sort dynamic type hint fields last because they depend on other values
         yield from sorted(
-            (f for f in cls.__dataclass_fields__.values() if cls.__is_valid_field(f)),
+            (f for f in cls.__dataclass_fields__.values() if is_valid_configspec_field(f)),
             key=lambda f: f.name in cls.__hint_resolvers__,
         )
 
     @classmethod
     def get_resolvable_fields(cls) -> Dict[str, type]:
         """Returns a mapping of fields to their type hints. Dunders should not be resolved and are not returned"""
-        return {f.name: f.type for f in cls._get_resolvable_dataclass_fields()}
+        return {
+            f.name: eval(f.type) if isinstance(f.type, str) else f.type  # type: ignore[arg-type]
+            for f in cls._get_resolvable_dataclass_fields()
+        }
 
     def is_resolved(self) -> bool:
         return self.__is_resolved__
@@ -283,7 +381,7 @@ class BaseConfiguration(MutableMapping[str, Any]):
         self.call_method_in_mro("on_resolved")
         self.__is_resolved__ = True
 
-    def copy(self: _T) -> _T:
+    def copy(self: _B) -> _B:
         """Returns a deep copy of the configuration instance"""
         return copy.deepcopy(self)
 
@@ -314,7 +412,7 @@ class BaseConfiguration(MutableMapping[str, Any]):
         """Iterator or valid key names"""
         return map(
             lambda field: field.name,
-            filter(lambda val: self.__is_valid_field(val), self.__dataclass_fields__.values()),
+            filter(lambda val: is_valid_configspec_field(val), self.__dataclass_fields__.values()),
         )
 
     def __len__(self) -> int:
@@ -330,13 +428,9 @@ class BaseConfiguration(MutableMapping[str, Any]):
     # helper functions
 
     def __has_attr(self, __key: str) -> bool:
-        return __key in self.__dataclass_fields__ and self.__is_valid_field(
+        return __key in self.__dataclass_fields__ and is_valid_configspec_field(
             self.__dataclass_fields__[__key]
         )
-
-    @staticmethod
-    def __is_valid_field(field: TDtcField) -> bool:
-        return not field.name.startswith("__") and field._field_type is dataclasses._FIELD  # type: ignore
 
     def call_method_in_mro(config, method_name: str) -> None:
         # python multi-inheritance is cooperative and this would require that all configurations cooperatively
@@ -355,26 +449,15 @@ class BaseConfiguration(MutableMapping[str, Any]):
 _F_BaseConfiguration = BaseConfiguration
 
 
+def is_valid_configspec_field(field: TDtcField) -> bool:
+    return not field.name.startswith("__") and field._field_type is dataclasses._FIELD  # type: ignore
+
+
 @configspec
 class CredentialsConfiguration(BaseConfiguration):
     """Base class for all credentials. Credentials are configurations that may be stored only by providers supporting secrets."""
 
     __section__: ClassVar[str] = "credentials"
-
-    @classmethod
-    def from_init_value(cls: Type[_C], init_value: Any = None) -> _C:
-        """Initializes credentials from `init_value`
-
-        Init value may be a native representation of the credentials or a dict. In case of native representation (for example a connection string or JSON with service account credentials)
-        a `parse_native_representation` method will be used to parse it. In case of a dict, the credentials object will be updated with key: values of the dict.
-        Unexpected values in the dict will be ignored.
-
-        Credentials will be marked as resolved if all required fields are set.
-        """
-        # create an instance
-        self = cls()
-        self._apply_init_value(init_value)
-        return self
 
     def to_native_credentials(self) -> Any:
         """Returns native credentials object.
@@ -382,16 +465,6 @@ class CredentialsConfiguration(BaseConfiguration):
         By default calls `to_native_representation` method.
         """
         return self.to_native_representation()
-
-    def _apply_init_value(self, init_value: Any = None) -> None:
-        if isinstance(init_value, C_Mapping):
-            self.update(init_value)
-        elif init_value is not None:
-            self.parse_native_representation(init_value)
-        else:
-            return
-        if not self.is_partial():
-            self.resolve()
 
     def __str__(self) -> str:
         """Get string representation of credentials to be displayed, with all secret parts removed"""
@@ -413,6 +486,9 @@ class CredentialsWithDefault:
         return None
 
 
+TInjectableContext = TypeVar("TInjectableContext", bound="ContainerInjectableContext")
+
+
 @configspec
 class ContainerInjectableContext(BaseConfiguration):
     """Base class for all configurations that may be injected from a Container. Injectable configuration is called a context"""
@@ -421,10 +497,24 @@ class ContainerInjectableContext(BaseConfiguration):
     """If True, `Container` is allowed to create default context instance, if none exists"""
     global_affinity: ClassVar[bool] = False
     """If True, `Container` will create context that will be visible in any thread. If False, per thread context is created"""
+    in_container: Annotated[bool, NotResolved()] = dataclasses.field(
+        default=False, init=False, repr=False, compare=False
+    )
+    """Current container, if None then not injected"""
+    extras_added: Annotated[bool, NotResolved()] = dataclasses.field(
+        default=False, init=False, repr=False, compare=False
+    )
+    """Tells if extras were already added to this context"""
 
     def add_extras(self) -> None:
-        """Called right after context was added to the container. Benefits mostly the config provider injection context which adds extra providers using the initial ones."""
+        """Called once after default context was created and added to the container. Benefits mostly the config provider injection context which adds extra providers using the initial ones."""
         pass
+
+    def after_add(self) -> None:
+        """Called each time after context is added to container"""
+
+    def before_remove(self) -> None:
+        """Called each time before context is removed from container"""
 
 
 _F_ContainerInjectableContext = ContainerInjectableContext

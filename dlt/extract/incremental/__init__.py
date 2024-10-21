@@ -6,8 +6,6 @@ from typing_extensions import get_origin, get_args
 import inspect
 from functools import wraps
 
-
-import dlt
 from dlt.common import logger
 from dlt.common.exceptions import MissingDependencyException
 from dlt.common.pendulum import pendulum
@@ -20,6 +18,7 @@ from dlt.common.typing import (
     extract_inner_type,
     get_generic_type_argument_from_instance,
     is_optional_type,
+    is_subclass,
 )
 from dlt.common.schema.typing import TColumnNames
 from dlt.common.configuration import configspec, ConfigurationValueError
@@ -36,7 +35,12 @@ from dlt.extract.incremental.exceptions import (
     IncrementalCursorPathMissing,
     IncrementalPrimaryKeyMissing,
 )
-from dlt.extract.incremental.typing import IncrementalColumnState, TCursorValue, LastValueFunc
+from dlt.extract.incremental.typing import (
+    IncrementalColumnState,
+    TCursorValue,
+    LastValueFunc,
+    OnCursorValueMissing,
+)
 from dlt.extract.pipe import Pipe
 from dlt.extract.items import SupportsPipe, TTableHintTemplate, ItemTransform
 from dlt.extract.incremental.transform import (
@@ -82,7 +86,7 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
     >>> info = p.run(r, destination="duckdb")
 
     Args:
-        cursor_path: The name or a JSON path to an cursor field. Uses the same names of fields as in your JSON document, before they are normalized to store in the database.
+        cursor_path: The name or a JSON path to a cursor field. Uses the same names of fields as in your JSON document, before they are normalized to store in the database.
         initial_value: Optional value used for `last_value` when no state is available, e.g. on the first run of the pipeline. If not provided `last_value` will be `None` on the first run.
         last_value_func: Callable used to determine which cursor value to save in state. It is called with a list of the stored state value and all cursor vals from currently processing items. Default is `max`
         primary_key: Optional primary key used to deduplicate data. If not provided, a primary key defined by the resource will be used. Pass a tuple to define a compound key. Pass empty tuple to disable unique checks
@@ -96,6 +100,7 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
             specified range of data. Currently Airflow scheduler is detected: "data_interval_start" and "data_interval_end" are taken from the context and passed Incremental class.
             The values passed explicitly to Incremental will be ignored.
             Note that if logical "end date" is present then also "end_value" will be set which means that resource state is not used and exactly this range of date will be loaded
+        on_cursor_value_missing: Specify what happens when the cursor_path does not exist in a record or a record has `None` at the cursor_path: raise, include, exclude
     """
 
     # this is config/dataclass so declare members
@@ -105,19 +110,22 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
     end_value: Optional[Any] = None
     row_order: Optional[TSortOrder] = None
     allow_external_schedulers: bool = False
+    on_cursor_value_missing: OnCursorValueMissing = "raise"
 
     # incremental acting as empty
     EMPTY: ClassVar["Incremental[Any]"] = None
+    placement_affinity: ClassVar[float] = 1  # stick to end
 
     def __init__(
         self,
-        cursor_path: str = dlt.config.value,
+        cursor_path: str = None,
         initial_value: Optional[TCursorValue] = None,
         last_value_func: Optional[LastValueFunc[TCursorValue]] = max,
         primary_key: Optional[TTableHintTemplate[TColumnNames]] = None,
         end_value: Optional[TCursorValue] = None,
         row_order: Optional[TSortOrder] = None,
         allow_external_schedulers: bool = False,
+        on_cursor_value_missing: OnCursorValueMissing = "raise",
     ) -> None:
         # make sure that path is valid
         if cursor_path:
@@ -133,6 +141,11 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
         self._primary_key: Optional[TTableHintTemplate[TColumnNames]] = primary_key
         self.row_order = row_order
         self.allow_external_schedulers = allow_external_schedulers
+        if on_cursor_value_missing not in ["raise", "include", "exclude"]:
+            raise ValueError(
+                f"Unexpected argument for on_cursor_value_missing. Got {on_cursor_value_missing}"
+            )
+        self.on_cursor_value_missing = on_cursor_value_missing
 
         self._cached_state: IncrementalColumnState = None
         """State dictionary cached on first access"""
@@ -171,6 +184,7 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
                 self.last_value_func,
                 self._primary_key,
                 set(self._cached_state["unique_hashes"]),
+                self.on_cursor_value_missing,
             )
 
     @classmethod
@@ -212,6 +226,9 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
         merged.resource_name = self.resource_name
         if other.resource_name:
             merged.resource_name = other.resource_name
+        # also pass if resolved
+        merged.__is_resolved__ = other.__is_resolved__
+        merged.__exception__ = other.__exception__
         return merged  # type: ignore
 
     def copy(self) -> "Incremental[TCursorValue]":
@@ -251,19 +268,26 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
 
     def parse_native_representation(self, native_value: Any) -> None:
         if isinstance(native_value, Incremental):
-            self.cursor_path = native_value.cursor_path
-            self.initial_value = native_value.initial_value
-            self.last_value_func = native_value.last_value_func
-            self.end_value = native_value.end_value
-            self.resource_name = native_value.resource_name
-            self._primary_key = native_value._primary_key
-            self.allow_external_schedulers = native_value.allow_external_schedulers
-            self.row_order = native_value.row_order
+            if self is self.EMPTY:
+                raise ValueError("Trying to resolve EMPTY Incremental")
+            if native_value is self.EMPTY:
+                raise ValueError(
+                    "Do not use EMPTY Incremental as default or explicit values. Pass None to reset"
+                    " an incremental."
+                )
+            merged = self.merge(native_value)
+            self.cursor_path = merged.cursor_path
+            self.initial_value = merged.initial_value
+            self.last_value_func = merged.last_value_func
+            self.end_value = merged.end_value
+            self.resource_name = merged.resource_name
+            self._primary_key = merged._primary_key
+            self.allow_external_schedulers = merged.allow_external_schedulers
+            self.row_order = merged.row_order
+            self.__is_resolved__ = self.__is_resolved__
         else:  # TODO: Maybe check if callable(getattr(native_value, '__lt__', None))
             # Passing bare value `incremental=44` gets parsed as initial_value
             self.initial_value = native_value
-        if not self.is_partial():
-            self.resolve()
 
     def get_state(self) -> IncrementalColumnState:
         """Returns an Incremental state for a particular cursor column"""
@@ -347,6 +371,7 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
                 f"Specified Incremental last value type {param_type} is not supported. Please use"
                 f" DateTime, Date, float, int or str to join external schedulers.({ex})"
             )
+            return
 
         if param_type is Any:
             logger.warning(
@@ -437,8 +462,9 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
 
     def __str__(self) -> str:
         return (
-            f"Incremental at {id(self)} for resource {self.resource_name} with cursor path:"
-            f" {self.cursor_path} initial {self.initial_value} lv_func {self.last_value_func}"
+            f"Incremental at 0x{id(self):x} for resource {self.resource_name} with cursor path:"
+            f" {self.cursor_path} initial {self.initial_value} - {self.end_value} lv_func"
+            f" {self.last_value_func}"
         )
 
     def _get_transformer(self, items: TDataItems) -> IncrementalTransform:
@@ -480,12 +506,17 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
         return rows
 
 
-Incremental.EMPTY = Incremental[Any]("")
+Incremental.EMPTY = Incremental[Any]()
+Incremental.EMPTY.__is_resolved__ = True
 
 
 class IncrementalResourceWrapper(ItemTransform[TDataItem]):
+    placement_affinity: ClassVar[float] = 1  # stick to end
+
     _incremental: Optional[Incremental[Any]] = None
     """Keeps the injectable incremental"""
+    _from_hints: bool = False
+    """If True, incremental was set explicitly from_hints"""
     _resource_name: str = None
 
     def __init__(self, primary_key: Optional[TTableHintTemplate[TColumnNames]] = None) -> None:
@@ -512,10 +543,7 @@ class IncrementalResourceWrapper(ItemTransform[TDataItem]):
         incremental_param: Optional[inspect.Parameter] = None
         for p in sig.parameters.values():
             annotation = extract_inner_type(p.annotation)
-            annotation = get_origin(annotation) or annotation
-            if (inspect.isclass(annotation) and issubclass(annotation, Incremental)) or isinstance(
-                p.default, Incremental
-            ):
+            if is_subclass(annotation, Incremental) or isinstance(p.default, Incremental):
                 incremental_param = p
                 break
         return incremental_param
@@ -535,8 +563,10 @@ class IncrementalResourceWrapper(ItemTransform[TDataItem]):
             if p.name in bound_args.arguments:
                 explicit_value = bound_args.arguments[p.name]
                 if explicit_value is Incremental.EMPTY or p.default is Incremental.EMPTY:
-                    # drop incremental
-                    pass
+                    raise ValueError(
+                        "Do not use EMPTY Incremental as default or explicit values. Pass None to"
+                        " reset an incremental."
+                    )
                 elif isinstance(explicit_value, Incremental):
                     # Explicit Incremental instance is merged with default
                     # allowing e.g. to only update initial_value/end_value but keeping default cursor_path
@@ -571,8 +601,9 @@ class IncrementalResourceWrapper(ItemTransform[TDataItem]):
             # set the incremental only if not yet set or if it was passed explicitly
             # NOTE: the _incremental may be also set by applying hints to the resource see `set_template` in `DltResource`
             if (new_incremental and p.name in bound_args.arguments) or not self._incremental:
-                self._incremental = new_incremental
-            self._incremental.resolve()
+                self.set_incremental(new_incremental)
+            if not self._incremental.is_resolved():
+                self._incremental.resolve()
             # in case of transformers the bind will be called before this wrapper is set: because transformer is called for a first time late in the pipe
             if self._resource_name:
                 # rebind internal _incremental from wrapper that already holds
@@ -582,6 +613,20 @@ class IncrementalResourceWrapper(ItemTransform[TDataItem]):
             return func(*bound_args.args, **bound_args.kwargs)
 
         return _wrap  # type: ignore
+
+    @property
+    def incremental(self) -> Optional[Incremental[Any]]:
+        return self._incremental
+
+    def set_incremental(
+        self, incremental: Optional[Incremental[Any]], from_hints: bool = False
+    ) -> None:
+        """Sets the incremental. If incremental was set from_hints, it can only be changed in the same manner"""
+        if self._from_hints and not from_hints:
+            # do not accept incremental if apply hints were used
+            return
+        self._from_hints = from_hints
+        self._incremental = incremental
 
     @property
     def allow_external_schedulers(self) -> bool:

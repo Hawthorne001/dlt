@@ -15,11 +15,11 @@ except ModuleNotFoundError:
     )
 
 from dlt.common.typing import DictStrAny, Any, StrAny
-from dlt.common.configuration.specs import RunConfiguration
+from dlt.common.configuration.specs import RuntimeConfiguration
 from dlt.common.runtime.exec_info import dlt_version_info, kube_pod_info, github_info
 
 
-def init_sentry(config: RunConfiguration) -> None:
+def init_sentry(config: RuntimeConfiguration) -> None:
     version = dlt_version_info(config.pipeline_name)
     sys_ver = version["dlt_version"]
     release = sys_ver + "_" + version.get("commit_sha", "")
@@ -28,7 +28,7 @@ def init_sentry(config: RunConfiguration) -> None:
     # https://docs.sentry.io/platforms/python/guides/logging/
     sentry_sdk.init(
         config.sentry_dsn,
-        before_send=before_send,
+        before_send=before_send,  # type: ignore
         traces_sample_rate=1.0,
         # disable tornado, boto3, sql alchemy etc.
         auto_enabling_integrations=False,
@@ -70,7 +70,7 @@ class _SentryHttpTransport(HttpTransport):
         return rv
 
 
-def _get_sentry_log_level(config: RunConfiguration) -> LoggingIntegration:
+def _get_sentry_log_level(config: RuntimeConfiguration) -> LoggingIntegration:
     log_level = logging._nameToLevel[config.log_level]
     event_level = logging.WARNING if log_level <= logging.WARNING else log_level
     return LoggingIntegration(

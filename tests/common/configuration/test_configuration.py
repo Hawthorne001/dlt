@@ -5,23 +5,36 @@ from typing import (
     Any,
     Dict,
     Final,
+    Generic,
     List,
+    Literal,
     Mapping,
     MutableMapping,
     NewType,
     Optional,
     Type,
     Union,
-    TYPE_CHECKING,
 )
+from typing_extensions import Annotated, TypeVar
 
 from dlt.common import json, pendulum, Decimal, Wei
 from dlt.common.configuration.providers.provider import ConfigProvider
+from dlt.common.configuration.specs.base_configuration import NotResolved, is_hint_not_resolvable
 from dlt.common.configuration.specs.gcp_credentials import (
     GcpServiceAccountCredentialsWithoutDefaults,
 )
 from dlt.common.utils import custom_environ, get_exception_trace, get_exception_trace_chain
-from dlt.common.typing import AnyType, DictStrAny, StrAny, TSecretValue, extract_inner_type
+from dlt.common.typing import (
+    AnyType,
+    CallableAny,
+    ConfigValue,
+    DictStrAny,
+    SecretSentinel,
+    StrAny,
+    TSecretStrValue,
+    TSecretValue,
+    extract_inner_type,
+)
 from dlt.common.configuration.exceptions import (
     ConfigFieldMissingTypeHintException,
     ConfigFieldTypeHintNotSupported,
@@ -40,7 +53,7 @@ from dlt.common.configuration import (
 )
 from dlt.common.configuration.specs import (
     BaseConfiguration,
-    RunConfiguration,
+    RuntimeConfiguration,
     ConnectionStringCredentials,
 )
 from dlt.common.configuration.providers import environ as environ_provider, toml
@@ -52,7 +65,9 @@ from dlt.common.configuration.utils import (
     add_config_dict_to_env,
     add_config_to_env,
 )
+from dlt.common.pipeline import TRefreshMode
 
+from dlt.destinations.impl.postgres.configuration import PostgresCredentials
 from tests.utils import preserve_environ
 from tests.common.configuration.utils import (
     MockProvider,
@@ -106,7 +121,7 @@ class VeryWrongConfiguration(WrongConfiguration):
 
 
 @configspec
-class ConfigurationWithOptionalTypes(RunConfiguration):
+class ConfigurationWithOptionalTypes(RuntimeConfiguration):
     pipeline_name: str = "Some Name"
 
     str_val: Optional[str] = None
@@ -120,12 +135,12 @@ class ProdConfigurationWithOptionalTypes(ConfigurationWithOptionalTypes):
 
 
 @configspec
-class MockProdConfiguration(RunConfiguration):
+class MockProdConfiguration(RuntimeConfiguration):
     pipeline_name: str = "comp"
 
 
 @configspec
-class FieldWithNoDefaultConfiguration(RunConfiguration):
+class FieldWithNoDefaultConfiguration(RuntimeConfiguration):
     no_default: str = None
 
 
@@ -171,7 +186,7 @@ class EmbeddedSecretConfiguration(BaseConfiguration):
 
 
 @configspec
-class NonTemplatedComplexTypesConfiguration(BaseConfiguration):
+class NonTemplatedNestedTypesConfiguration(BaseConfiguration):
     list_val: list = None  # type: ignore[type-arg]
     tuple_val: tuple = None  # type: ignore[type-arg]
     dict_val: dict = None  # type: ignore[type-arg]
@@ -237,6 +252,11 @@ class SubclassConfigWithDynamicType(ConfigWithDynamicType):
         if self.is_number:
             return int
         return str
+
+
+@configspec
+class ConfigWithLiteralField(BaseConfiguration):
+    refresh: TRefreshMode = None
 
 
 LongInteger = NewType("LongInteger", int)
@@ -308,6 +328,32 @@ def test_explicit_values_false_when_bool() -> None:
     assert c.head == ""
     assert c.tube == []
     assert c.heels == ""
+
+
+def test_explicit_embedded_config(environment: Any) -> None:
+    instr_explicit = InstrumentedConfiguration(head="h", tube=["tu", "be"], heels="xhe")
+
+    environment["INSTRUMENTED__HEAD"] = "hed"
+    c = resolve.resolve_configuration(
+        EmbeddedConfiguration(default="X", sectioned=SectionedConfiguration(password="S")),
+        explicit_value={"instrumented": instr_explicit},
+    )
+
+    # explicit value will be part of the resolved configuration
+    assert c.instrumented is instr_explicit
+    # configuration was injected from env
+    assert c.instrumented.head == "hed"
+
+    # the same but with resolved
+    instr_explicit = InstrumentedConfiguration(head="h", tube=["tu", "be"], heels="xhe")
+    instr_explicit.resolve()
+    c = resolve.resolve_configuration(
+        EmbeddedConfiguration(default="X", sectioned=SectionedConfiguration(password="S")),
+        explicit_value={"instrumented": instr_explicit},
+    )
+    assert c.instrumented is instr_explicit
+    # but configuration is not injected
+    assert c.instrumented.head == "h"
 
 
 def test_default_values(environment: Any) -> None:
@@ -407,6 +453,43 @@ def test_invalid_native_config_value() -> None:
     assert py_ex.value.spec is InstrumentedConfiguration
     assert py_ex.value.native_value_type is int
     assert py_ex.value.embedded_sections == ()
+
+
+def test_maybe_use_explicit_value() -> None:
+    # pass through dict and configs
+    c = ConnectionStringCredentials()
+    dict_explicit = {"explicit": "is_dict"}
+    config_explicit = BaseConfiguration()
+    assert resolve._maybe_parse_native_value(c, dict_explicit, ()) is dict_explicit
+    assert resolve._maybe_parse_native_value(c, config_explicit, ()) is config_explicit
+
+    # postgres credentials have a default parameter (connect_timeout), which must be removed for explicit value
+    pg_c = PostgresCredentials()
+    explicit_value = resolve._maybe_parse_native_value(
+        pg_c, "postgres://loader@localhost:5432/dlt_data?a=b&c=d", ()
+    )
+    # NOTE: connect_timeout and password are not present
+    assert explicit_value == {
+        "drivername": "postgres",
+        "database": "dlt_data",
+        "username": "loader",
+        "host": "localhost",
+        "query": {"a": "b", "c": "d"},
+    }
+    pg_c = PostgresCredentials()
+    explicit_value = resolve._maybe_parse_native_value(
+        pg_c, "postgres://loader@localhost:5432/dlt_data?connect_timeout=33", ()
+    )
+    assert explicit_value["connect_timeout"] == 33
+
+
+def test_optional_params_resolved_if_complete_native_value(environment: Any) -> None:
+    # this native value fully resolves configuration
+    environment["CREDENTIALS"] = "postgres://loader:pwd@localhost:5432/dlt_data?a=b&c=d"
+    # still this config value will be injected
+    environment["CREDENTIALS__CONNECT_TIMEOUT"] = "300"
+    c = resolve.resolve_configuration(PostgresCredentials())
+    assert c.connect_timeout == 300
 
 
 def test_on_resolved(environment: Any) -> None:
@@ -522,13 +605,13 @@ def test_provider_values_over_embedded_default(environment: Any) -> None:
 
 
 def test_run_configuration_gen_name(environment: Any) -> None:
-    C = resolve.resolve_configuration(RunConfiguration())
+    C = resolve.resolve_configuration(RuntimeConfiguration())
     assert C.pipeline_name.startswith("dlt_")
 
 
 def test_configuration_is_mutable_mapping(environment: Any, env_provider: ConfigProvider) -> None:
     @configspec
-    class _SecretCredentials(RunConfiguration):
+    class _SecretCredentials(RuntimeConfiguration):
         pipeline_name: Optional[str] = "secret"
         secret_value: TSecretValue = None
         config_files_storage_path: str = "storage"
@@ -540,9 +623,9 @@ def test_configuration_is_mutable_mapping(environment: Any, env_provider: Config
         "sentry_dsn": None,
         "slack_incoming_hook": None,
         "dlthub_telemetry": True,
-        "dlthub_telemetry_segment_write_key": "TLJiyRkGVZGCi2TtjClamXpFcxAA1rSB",
-        "dlthub_telemetry_endpoint": "https://api.segment.io/v1/track",
-        "log_format": "{asctime}|[{levelname:<21}]|{process}|{thread}|{name}|{filename}|{funcName}:{lineno}|{message}",
+        "dlthub_telemetry_endpoint": "https://telemetry-tracker.services4758.workers.dev",
+        "dlthub_telemetry_segment_write_key": None,
+        "log_format": "{asctime}|[{levelname}]|{process}|{thread}|{name}|{filename}|{funcName}:{lineno}|{message}",
         "log_level": "WARNING",
         "request_timeout": 60,
         "request_max_attempts": 5,
@@ -570,6 +653,7 @@ def test_configuration_is_mutable_mapping(environment: Any, env_provider: Config
     assert c.keys() == expected_dict.keys()
     assert len(c) == len(expected_dict)
     assert c.items() == expected_dict.items()
+    # comparing list compares order
     assert list(c.values()) == list(expected_dict.values())
     for key in c:
         assert c[key] == expected_dict[key]
@@ -723,7 +807,7 @@ def test_find_all_keys() -> None:
 
 
 def test_coercion_to_hint_types(environment: Any) -> None:
-    add_config_dict_to_env(COERCIONS)
+    add_config_dict_to_env(COERCIONS, destructure_dicts=False)
 
     C = CoercionTestConfiguration()
     resolve._resolve_config_fields(
@@ -787,7 +871,7 @@ def test_values_serialization() -> None:
 
 def test_invalid_coercions(environment: Any) -> None:
     C = CoercionTestConfiguration()
-    add_config_dict_to_env(INVALID_COERCIONS)
+    add_config_dict_to_env(INVALID_COERCIONS, destructure_dicts=False)
     for key, value in INVALID_COERCIONS.items():
         try:
             resolve._resolve_config_fields(
@@ -809,8 +893,8 @@ def test_invalid_coercions(environment: Any) -> None:
 
 def test_excepted_coercions(environment: Any) -> None:
     C = CoercionTestConfiguration()
-    add_config_dict_to_env(COERCIONS)
-    add_config_dict_to_env(EXCEPTED_COERCIONS, overwrite_keys=True)
+    add_config_dict_to_env(COERCIONS, destructure_dicts=False)
+    add_config_dict_to_env(EXCEPTED_COERCIONS, overwrite_keys=True, destructure_dicts=False)
     resolve._resolve_config_fields(
         C, explicit_values=None, explicit_sections=(), embedded_sections=(), accept_partial=False
     )
@@ -839,11 +923,11 @@ def test_config_with_no_hints(environment: Any) -> None:
         NoHintConfiguration()
 
 
-def test_config_with_non_templated_complex_hints(environment: Any) -> None:
+def test_config_with_non_templated_nested_hints(environment: Any) -> None:
     environment["LIST_VAL"] = "[1,2,3]"
     environment["TUPLE_VAL"] = "(1,2,3)"
     environment["DICT_VAL"] = '{"a": 1}'
-    c = resolve.resolve_configuration(NonTemplatedComplexTypesConfiguration())
+    c = resolve.resolve_configuration(NonTemplatedNestedTypesConfiguration())
     assert c.list_val == [1, 2, 3]
     assert c.tuple_val == (1, 2, 3)
     assert c.dict_val == {"a": 1}
@@ -905,8 +989,8 @@ def test_coercion_rules() -> None:
 def test_is_valid_hint() -> None:
     assert is_valid_hint(Any) is True  # type: ignore[arg-type]
     assert is_valid_hint(Optional[Any]) is True  # type: ignore[arg-type]
-    assert is_valid_hint(RunConfiguration) is True
-    assert is_valid_hint(Optional[RunConfiguration]) is True  # type: ignore[arg-type]
+    assert is_valid_hint(RuntimeConfiguration) is True
+    assert is_valid_hint(Optional[RuntimeConfiguration]) is True  # type: ignore[arg-type]
     assert is_valid_hint(TSecretValue) is True
     assert is_valid_hint(Optional[TSecretValue]) is True  # type: ignore[arg-type]
     # in case of generics, origin will be used and args are not checked
@@ -916,6 +1000,60 @@ def test_is_valid_hint() -> None:
     assert is_valid_hint(Wei) is True
     # any class type, except deriving from BaseConfiguration is wrong type
     assert is_valid_hint(ConfigFieldMissingException) is False
+    # but final and annotated types are not ok because they are not resolved
+    assert is_valid_hint(Final[ConfigFieldMissingException]) is True  # type: ignore[arg-type]
+    assert is_valid_hint(Annotated[ConfigFieldMissingException, NotResolved()]) is True  # type: ignore[arg-type]
+    assert is_valid_hint(Annotated[ConfigFieldMissingException, "REQ"]) is False  # type: ignore[arg-type]
+
+
+def test_is_not_resolved_hint() -> None:
+    assert is_hint_not_resolvable(Final[ConfigFieldMissingException]) is True
+    assert is_hint_not_resolvable(Annotated[ConfigFieldMissingException, NotResolved()]) is True
+    assert is_hint_not_resolvable(Annotated[ConfigFieldMissingException, NotResolved(True)]) is True
+    assert (
+        is_hint_not_resolvable(Annotated[ConfigFieldMissingException, NotResolved(False)]) is False
+    )
+    assert is_hint_not_resolvable(Annotated[ConfigFieldMissingException, "REQ"]) is False
+    assert is_hint_not_resolvable(str) is False
+
+
+def test_not_resolved_hint() -> None:
+    class SentinelClass:
+        pass
+
+    @configspec
+    class OptionalNotResolveConfiguration(BaseConfiguration):
+        trace: Final[Optional[SentinelClass]] = None
+        traces: Annotated[Optional[List[SentinelClass]], NotResolved()] = None
+
+    c = resolve.resolve_configuration(OptionalNotResolveConfiguration())
+    assert c.trace is None
+    assert c.traces is None
+
+    s1 = SentinelClass()
+    s2 = SentinelClass()
+
+    c = resolve.resolve_configuration(OptionalNotResolveConfiguration(s1, [s2]))
+    assert c.trace is s1
+    assert c.traces[0] is s2
+
+    @configspec
+    class NotResolveConfiguration(BaseConfiguration):
+        trace: Final[SentinelClass] = None
+        traces: Annotated[List[SentinelClass], NotResolved()] = None
+
+    with pytest.raises(ConfigFieldMissingException):
+        resolve.resolve_configuration(NotResolveConfiguration())
+
+    with pytest.raises(ConfigFieldMissingException):
+        resolve.resolve_configuration(NotResolveConfiguration(trace=s1))
+
+    with pytest.raises(ConfigFieldMissingException):
+        resolve.resolve_configuration(NotResolveConfiguration(traces=[s2]))
+
+    c2 = resolve.resolve_configuration(NotResolveConfiguration(s1, [s2]))
+    assert c2.trace is s1
+    assert c2.traces[0] is s2
 
 
 def test_configspec_auto_base_config_derivation() -> None:
@@ -956,7 +1094,7 @@ def test_do_not_resolve_twice(environment: Any) -> None:
     c = resolve.resolve_configuration(SecretConfiguration())
     assert c.secret_value == "password"
     c2 = SecretConfiguration()
-    c2.secret_value = "other"  # type: ignore[assignment]
+    c2.secret_value = "other"
     c2.__is_resolved__ = True
     assert c2.is_resolved()
     # will not overwrite with env
@@ -969,7 +1107,7 @@ def test_do_not_resolve_twice(environment: Any) -> None:
     assert c4.secret_value == "password"
     assert c2 is c3 is c4
     # also c is resolved so
-    c.secret_value = "else"  # type: ignore[assignment]
+    c.secret_value = "else"
     assert resolve.resolve_configuration(c).secret_value == "else"
 
 
@@ -978,7 +1116,7 @@ def test_do_not_resolve_embedded(environment: Any) -> None:
     c = resolve.resolve_configuration(EmbeddedSecretConfiguration())
     assert c.secret.secret_value == "password"
     c2 = SecretConfiguration()
-    c2.secret_value = "other"  # type: ignore[assignment]
+    c2.secret_value = "other"
     c2.__is_resolved__ = True
     embed_c = EmbeddedSecretConfiguration()
     embed_c.secret = c2
@@ -1076,13 +1214,23 @@ def test_extract_inner_hint() -> None:
     # extracts new types
     assert resolve.extract_inner_hint(TSecretValue) is AnyType
     # preserves new types on extract
-    assert resolve.extract_inner_hint(TSecretValue, preserve_new_types=True) is TSecretValue
+    assert resolve.extract_inner_hint(CallableAny, preserve_new_types=True) is CallableAny
+    # extracts and preserves annotated
+    assert resolve.extract_inner_hint(Optional[Annotated[int, "X"]]) is int  # type: ignore[arg-type]
+    TAnnoInt = Annotated[int, "X"]
+    assert resolve.extract_inner_hint(Optional[TAnnoInt], preserve_annotated=True) is TAnnoInt  # type: ignore[arg-type]
+    # extracts and preserves literals
+    TLit = Literal["a", "b"]
+    TAnnoLit = Annotated[TLit, "X"]
+    assert resolve.extract_inner_hint(TAnnoLit, preserve_literal=True) is TLit  # type: ignore[arg-type]
+    assert resolve.extract_inner_hint(TAnnoLit, preserve_literal=False) is str  # type: ignore[arg-type]
 
 
 def test_is_secret_hint() -> None:
     assert resolve.is_secret_hint(GcpServiceAccountCredentialsWithoutDefaults) is True
     assert resolve.is_secret_hint(Optional[GcpServiceAccountCredentialsWithoutDefaults]) is True  # type: ignore[arg-type]
     assert resolve.is_secret_hint(TSecretValue) is True
+    assert resolve.is_secret_hint(TSecretStrValue) is True
     assert resolve.is_secret_hint(Optional[TSecretValue]) is True  # type: ignore[arg-type]
     assert resolve.is_secret_hint(InstrumentedConfiguration) is False
     # do not recognize new types
@@ -1098,9 +1246,8 @@ def test_is_secret_hint() -> None:
 
 
 def test_is_secret_hint_custom_type() -> None:
-    # any new type named TSecretValue is a secret
-    assert resolve.is_secret_hint(NewType("TSecretValue", int)) is True
-    assert resolve.is_secret_hint(NewType("TSecretValueX", int)) is False
+    # any type annotated with SecretSentinel is secret
+    assert resolve.is_secret_hint(Annotated[int, SecretSentinel]) is True  # type: ignore[arg-type]
 
 
 def coerce_single_value(key: str, value: str, hint: Type[Any]) -> Any:
@@ -1201,6 +1348,15 @@ def test_add_config_to_env(environment: Dict[str, str]) -> None:
     add_config_to_env(c.sectioned)
     assert environment == {"DLT_TEST__PASSWORD": "PASS"}
 
+    # dicts should be added as sections
+    environment.clear()
+    c_s = ConnectionStringCredentials(
+        "mssql://loader:<password>@loader.database.windows.net/dlt_data?TrustServerCertificate=yes&Encrypt=yes&LongAsMax=yes"
+    )
+    add_config_to_env(c_s, ("dlt",))
+    assert environment["DLT__CREDENTIALS__QUERY__ENCRYPT"] == "yes"
+    assert environment["DLT__CREDENTIALS__QUERY__TRUSTSERVERCERTIFICATE"] == "yes"
+
 
 def test_configuration_copy() -> None:
     c = resolve.resolve_configuration(
@@ -1256,3 +1412,89 @@ def test_configuration_with_configuration_as_default() -> None:
     c_resolved = resolve.resolve_configuration(c_instance)
     assert c_resolved.is_resolved()
     assert c_resolved.conn_str.is_resolved()
+
+
+def test_configuration_with_generic(environment: Dict[str, str]) -> None:
+    TColumn = TypeVar("TColumn", bound=str)
+
+    @configspec
+    class IncrementalConfiguration(BaseConfiguration, Generic[TColumn]):
+        # TODO: support generics field
+        column: str = ConfigValue
+
+    @configspec
+    class SourceConfiguration(BaseConfiguration):
+        name: str = ConfigValue
+        incremental: IncrementalConfiguration[str] = ConfigValue
+
+    # resolve incremental
+    environment["COLUMN"] = "column"
+    c = resolve.resolve_configuration(IncrementalConfiguration[str]())
+    assert c.column == "column"
+
+    # resolve embedded config with generic
+    environment["INCREMENTAL__COLUMN"] = "column_i"
+    c2 = resolve.resolve_configuration(SourceConfiguration(name="name"))
+    assert c2.incremental.column == "column_i"
+
+    # put incremental in union
+    @configspec
+    class SourceUnionConfiguration(BaseConfiguration):
+        name: str = ConfigValue
+        incremental_union: Optional[IncrementalConfiguration[str]] = ConfigValue
+
+    c3 = resolve.resolve_configuration(SourceUnionConfiguration(name="name"))
+    assert c3.incremental_union is None
+    environment["INCREMENTAL_UNION__COLUMN"] = "column_u"
+    c3 = resolve.resolve_configuration(SourceUnionConfiguration(name="name"))
+    assert c3.incremental_union.column == "column_u"
+
+    class Sentinel:
+        pass
+
+    class SubSentinel(Sentinel):
+        pass
+
+    @configspec
+    class SourceWideUnionConfiguration(BaseConfiguration):
+        name: str = ConfigValue
+        incremental_w_union: Union[IncrementalConfiguration[str], str, Sentinel] = ConfigValue
+        incremental_sub: Optional[Union[IncrementalConfiguration[str], str, SubSentinel]] = None
+
+    with pytest.raises(ConfigFieldMissingException):
+        resolve.resolve_configuration(SourceWideUnionConfiguration(name="name"))
+
+    # use explicit sentinel
+    sentinel = Sentinel()
+    c4 = resolve.resolve_configuration(
+        SourceWideUnionConfiguration(name="name"), explicit_value={"incremental_w_union": sentinel}
+    )
+    assert c4.incremental_w_union is sentinel
+
+    # instantiate incremental
+    environment["INCREMENTAL_W_UNION__COLUMN"] = "column_w_u"
+    c4 = resolve.resolve_configuration(SourceWideUnionConfiguration(name="name"))
+    assert c4.incremental_w_union.column == "column_w_u"  # type: ignore[union-attr]
+
+    # sentinel (of super class type) also works for hint of subclass type
+    c4 = resolve.resolve_configuration(
+        SourceWideUnionConfiguration(name="name"), explicit_value={"incremental_sub": sentinel}
+    )
+    assert c4.incremental_sub is sentinel
+
+
+def test_configuration_with_literal_field(environment: Dict[str, str]) -> None:
+    """Literal type fields only allow values from the literal"""
+    environment["REFRESH"] = "not_a_refresh_mode"
+
+    with pytest.raises(ConfigValueCannotBeCoercedException) as einfo:
+        resolve.resolve_configuration(ConfigWithLiteralField())
+
+    assert einfo.value.field_name == "refresh"
+    assert einfo.value.field_value == "not_a_refresh_mode"
+    assert einfo.value.hint == TRefreshMode
+
+    environment["REFRESH"] = "drop_data"
+
+    spec = resolve.resolve_configuration(ConfigWithLiteralField())
+    assert spec.refresh == "drop_data"

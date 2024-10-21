@@ -4,7 +4,6 @@ import traceback
 from logging import LogRecord, Logger
 from typing import Any, Mapping, Iterator, Protocol
 
-DLT_LOGGER_NAME = "dlt"
 LOGGER: Logger = None
 
 
@@ -34,11 +33,11 @@ def metrics(name: str, extra: Mapping[str, Any], stacklevel: int = 1) -> None:
 
 
 @contextlib.contextmanager
-def suppress_and_warn() -> Iterator[None]:
+def suppress_and_warn(msg: str) -> Iterator[None]:
     try:
         yield
     except Exception:
-        LOGGER.warning("Suppressed exception", exc_info=True)
+        LOGGER.warning(msg, exc_info=True)
 
 
 def is_logging() -> bool:
@@ -70,7 +69,7 @@ class _MetricsFormatter(logging.Formatter):
         return s
 
 
-def _init_logging(
+def _create_logger(
     logger_name: str, level: str, fmt: str, component: str, version: Mapping[str, str]
 ) -> Logger:
     if logger_name == "root":
@@ -81,7 +80,7 @@ def _init_logging(
         logger = logging.getLogger(logger_name)
         logger.propagate = False
         logger.setLevel(level)
-        # get or create logging handler
+        # get or create logging handler, we log to stderr by default
         handler = next(iter(logger.handlers), logging.StreamHandler())
         logger.addHandler(handler)
 
@@ -111,3 +110,14 @@ def _init_logging(
         handler.setFormatter(_MetricsFormatter(fmt=fmt, style="{"))
 
     return logger
+
+
+def _delete_current_logger() -> None:
+    if not LOGGER:
+        return
+
+    for handler in LOGGER.handlers[:]:
+        LOGGER.removeHandler(handler)
+
+    LOGGER.disabled = True
+    LOGGER.propagate = False

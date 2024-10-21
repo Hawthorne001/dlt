@@ -1,4 +1,5 @@
 import io
+import glob
 import gzip
 import mimetypes
 import pathlib
@@ -20,7 +21,7 @@ from typing import (
 )
 from urllib.parse import urlparse
 
-from fsspec import AbstractFileSystem, register_implementation
+from fsspec import AbstractFileSystem, register_implementation, get_filesystem_class
 from fsspec.core import url_to_fs
 
 from dlt import version
@@ -29,9 +30,14 @@ from dlt.common.configuration.specs import (
     GcpCredentials,
     AwsCredentials,
     AzureCredentials,
+    SFTPCredentials,
 )
 from dlt.common.exceptions import MissingDependencyException
-from dlt.common.storages.configuration import FileSystemCredentials, FilesystemConfiguration
+from dlt.common.storages.configuration import (
+    FileSystemCredentials,
+    FilesystemConfiguration,
+    make_fsspec_url,
+)
 from dlt.common.time import ensure_pendulum_datetime
 from dlt.common.typing import DictStrAny
 
@@ -41,6 +47,7 @@ class FileItem(TypedDict, total=False):
 
     file_url: str
     file_name: str
+    relative_path: str
     mime_type: str
     encoding: Optional[str]
     modification_date: pendulum.DateTime
@@ -58,23 +65,37 @@ MTIME_DISPATCH = {
     "file": lambda f: ensure_pendulum_datetime(f["mtime"]),
     "memory": lambda f: ensure_pendulum_datetime(f["created"]),
     "gdrive": lambda f: ensure_pendulum_datetime(f["modifiedTime"]),
+    "sftp": lambda f: ensure_pendulum_datetime(f["mtime"]),
 }
 # Support aliases
 MTIME_DISPATCH["gs"] = MTIME_DISPATCH["gcs"]
 MTIME_DISPATCH["s3a"] = MTIME_DISPATCH["s3"]
 MTIME_DISPATCH["abfs"] = MTIME_DISPATCH["az"]
+MTIME_DISPATCH["abfss"] = MTIME_DISPATCH["az"]
 
 # Map of protocol to a filesystem type
 CREDENTIALS_DISPATCH: Dict[str, Callable[[FilesystemConfiguration], DictStrAny]] = {
     "s3": lambda config: cast(AwsCredentials, config.credentials).to_s3fs_credentials(),
-    "adl": lambda config: cast(AzureCredentials, config.credentials).to_adlfs_credentials(),
     "az": lambda config: cast(AzureCredentials, config.credentials).to_adlfs_credentials(),
-    "gcs": lambda config: cast(GcpCredentials, config.credentials).to_gcs_credentials(),
     "gs": lambda config: cast(GcpCredentials, config.credentials).to_gcs_credentials(),
     "gdrive": lambda config: {"credentials": cast(GcpCredentials, config.credentials)},
-    "abfs": lambda config: cast(AzureCredentials, config.credentials).to_adlfs_credentials(),
-    "azure": lambda config: cast(AzureCredentials, config.credentials).to_adlfs_credentials(),
+    "sftp": lambda config: cast(SFTPCredentials, config.credentials).to_fsspec_credentials(),
 }
+CREDENTIALS_DISPATCH["adl"] = CREDENTIALS_DISPATCH["az"]
+CREDENTIALS_DISPATCH["abfs"] = CREDENTIALS_DISPATCH["az"]
+CREDENTIALS_DISPATCH["azure"] = CREDENTIALS_DISPATCH["az"]
+CREDENTIALS_DISPATCH["abfss"] = CREDENTIALS_DISPATCH["az"]
+CREDENTIALS_DISPATCH["gcs"] = CREDENTIALS_DISPATCH["gs"]
+
+# Default kwargs for protocol
+DEFAULT_KWARGS = {
+    # disable concurrent
+    "az": {"max_concurrency": 1}
+}
+DEFAULT_KWARGS["adl"] = DEFAULT_KWARGS["az"]
+DEFAULT_KWARGS["abfs"] = DEFAULT_KWARGS["az"]
+DEFAULT_KWARGS["azure"] = DEFAULT_KWARGS["az"]
+DEFAULT_KWARGS["abfss"] = DEFAULT_KWARGS["az"]
 
 
 def fsspec_filesystem(
@@ -88,7 +109,7 @@ def fsspec_filesystem(
     Please supply credentials instance corresponding to the protocol.
     The `protocol` is just the code name of the filesystem i.e.:
     * s3
-    * az, abfs
+    * az, abfs, abfss, adl, azure
     * gcs, gs
 
     also see filesystem_from_config
@@ -117,6 +138,11 @@ def prepare_fsspec_args(config: FilesystemConfiguration) -> DictStrAny:
 
         register_implementation("gdrive", GoogleDriveFileSystem, "GoogleDriveFileSystem")
 
+    fs_kwargs.update(DEFAULT_KWARGS.get(protocol, {}))
+
+    if protocol == "sftp":
+        fs_kwargs.clear()
+
     if config.kwargs is not None:
         fs_kwargs.update(config.kwargs)
     if config.client_kwargs is not None:
@@ -134,8 +160,9 @@ def fsspec_from_config(config: FilesystemConfiguration) -> Tuple[AbstractFileSys
 
     Authenticates following filesystems:
     * s3
-    * az, abfs
+    * az, abfs, abfss, adl, azure
     * gcs, gs
+    * sftp
 
     All other filesystems are not authenticated
 
@@ -144,8 +171,14 @@ def fsspec_from_config(config: FilesystemConfiguration) -> Tuple[AbstractFileSys
     fs_kwargs = prepare_fsspec_args(config)
 
     try:
+        # first get the class to check the protocol
+        fs_cls = get_filesystem_class(config.protocol)
+        if fs_cls.protocol == "abfs":
+            # if storage account is present in bucket_url and in credentials, az fsspec will fail
+            if urlparse(config.bucket_url).username:
+                fs_kwargs.pop("account_name")
         return url_to_fs(config.bucket_url, **fs_kwargs)  # type: ignore
-    except ModuleNotFoundError as e:
+    except ImportError as e:
         raise MissingDependencyException(
             "filesystem", [f"{version.DLT_PKG_NAME}[{config.protocol}]"]
         ) from e
@@ -181,6 +214,16 @@ class FileItemDict(DictStrAny):
         else:
             return fsspec_filesystem(self["file_url"], self.credentials)[0]
 
+    @property
+    def local_file_path(self) -> str:
+        """Gets a valid local filesystem path from file:// scheme.
+        Supports POSIX/Windows/UNC paths
+
+        Returns:
+            str: local filesystem path
+        """
+        return FilesystemConfiguration.make_local_path(self["file_url"])
+
     def open(  # noqa: A003
         self,
         mode: str = "rb",
@@ -213,7 +256,6 @@ class FileItemDict(DictStrAny):
             raise ValueError("""The argument `compression` must have one of the following values:
                 "auto", "enable", "disable".""")
 
-        opened_file: IO[Any]
         # if the user has already extracted the content, we use it so there is no need to
         # download the file again.
         if "file_content" in self:
@@ -234,10 +276,14 @@ class FileItemDict(DictStrAny):
                 **text_kwargs,
             )
         else:
-            opened_file = self.fsspec.open(
-                self["file_url"], mode=mode, compression=compression_arg, **kwargs
+            if "file" in self.fsspec.protocol:
+                # use native local file path to open file:// uris
+                file_url = self.local_file_path
+            else:
+                file_url = self["file_url"]
+            return self.fsspec.open(  # type: ignore[no-any-return]
+                file_url, mode=mode, compression=compression_arg, **kwargs
             )
-        return opened_file
 
     def read_bytes(self) -> bytes:
         """Read the file content.
@@ -245,11 +291,11 @@ class FileItemDict(DictStrAny):
         Returns:
             bytes: The file content.
         """
-        return (  # type: ignore
-            self["file_content"]
-            if "file_content" in self and self["file_content"] is not None
-            else self.fsspec.read_bytes(self["file_url"])
-        )
+        if "file_content" in self and self["file_content"] is not None:
+            return self["file_content"]  # type: ignore
+        else:
+            with self.open(mode="rb", compression="disable") as f:
+                return f.read()  # type: ignore[no-any-return]
 
 
 def guess_mime_type(file_name: str) -> Sequence[str]:
@@ -274,45 +320,51 @@ def glob_files(
     Returns:
         Iterable[FileItem]: The list of files.
     """
-    import os
-
+    is_local_fs = "file" in fs_client.protocol
+    if is_local_fs and FilesystemConfiguration.is_local_path(bucket_url):
+        bucket_url = FilesystemConfiguration.make_file_url(bucket_url)
     bucket_url_parsed = urlparse(bucket_url)
-    # if this is a file path without a scheme
-    if not bucket_url_parsed.scheme or (os.path.isabs(bucket_url) and "\\" in bucket_url):
-        # this is a file so create a proper file url
-        bucket_url = pathlib.Path(bucket_url).absolute().as_uri()
-        bucket_url_parsed = urlparse(bucket_url)
-    bucket_url_no_schema = bucket_url_parsed._replace(scheme="", query="").geturl()
-    bucket_url_no_schema = (
-        bucket_url_no_schema[2:] if bucket_url_no_schema.startswith("//") else bucket_url_no_schema
-    )
-    filter_url = posixpath.join(bucket_url_no_schema, file_glob)
 
-    glob_result = fs_client.glob(filter_url, detail=True)
-    if isinstance(glob_result, list):
-        raise NotImplementedError(
-            "Cannot request details when using fsspec.glob. For adlfs (Azure) please use version"
-            " 2023.9.0 or later"
-        )
+    if is_local_fs:
+        root_dir = FilesystemConfiguration.make_local_path(bucket_url)
+        # use a Python glob to get files
+        files = glob.glob(str(pathlib.Path(root_dir).joinpath(file_glob)), recursive=True)
+        glob_result = {file: fs_client.info(file) for file in files}
+    else:
+        # convert to fs_path
+        root_dir = fs_client._strip_protocol(bucket_url)
+        filter_url = posixpath.join(root_dir, file_glob)
+        glob_result = fs_client.glob(filter_url, detail=True)
+        if isinstance(glob_result, list):
+            raise NotImplementedError(
+                "Cannot request details when using fsspec.glob. For adlfs (Azure) please use"
+                " version 2023.9.0 or later"
+            )
 
     for file, md in glob_result.items():
         if md["type"] != "file":
             continue
+        scheme = bucket_url_parsed.scheme
 
-        # make that absolute path on a file://
-        if bucket_url_parsed.scheme == "file" and not file.startswith("/"):
-            file = f"/{file}"
-        file_name = posixpath.relpath(file, bucket_url_no_schema)
-        file_url = bucket_url_parsed._replace(
-            path=posixpath.join(bucket_url_parsed.path, file_name)
-        ).geturl()
+        # relative paths are always POSIX
+        if is_local_fs:
+            # use OS pathlib for local paths
+            loc_path = pathlib.Path(file)
+            file_name = loc_path.name
+            rel_path = loc_path.relative_to(root_dir).as_posix()
+            file_url = FilesystemConfiguration.make_file_url(file)
+        else:
+            file_name = posixpath.basename(file)
+            rel_path = posixpath.relpath(file, root_dir)
+            file_url = make_fsspec_url(scheme, file, bucket_url)
 
-        mime_type, encoding = guess_mime_type(file_name)
+        mime_type, encoding = guess_mime_type(rel_path)
         yield FileItem(
             file_name=file_name,
+            relative_path=rel_path,
             file_url=file_url,
             mime_type=mime_type,
             encoding=encoding,
-            modification_date=MTIME_DISPATCH[bucket_url_parsed.scheme](md),
+            modification_date=MTIME_DISPATCH[scheme](md),
             size_in_bytes=int(md["size"]),
         )

@@ -2,7 +2,7 @@ import contextlib
 from collections.abc import Sequence as C_Sequence
 from copy import copy
 import itertools
-from typing import Iterator, List, Dict, Any
+from typing import Iterator, List, Dict, Any, Optional
 import yaml
 
 from dlt.common.configuration.container import Container
@@ -25,17 +25,17 @@ from dlt.common.schema.typing import (
     TAnySchemaColumns,
     TColumnNames,
     TSchemaContract,
+    TTableFormat,
     TWriteDispositionConfig,
 )
 from dlt.common.storages import NormalizeStorageConfiguration, LoadPackageInfo, SchemaStorage
 from dlt.common.storages.load_package import (
     ParsedLoadJobFileName,
     LoadPackageStateInjectableContext,
-    TPipelineStateDoc,
+    TLoadPackageState,
+    commit_load_package_state,
 )
-
-
-from dlt.common.utils import get_callable_name, get_full_class_name
+from dlt.common.utils import get_callable_name, get_full_class_name, group_dict_of_lists
 
 from dlt.extract.decorators import SourceInjectableContext, SourceSchemaInjectableContext
 from dlt.extract.exceptions import DataItemRequiredForDynamicTableHints
@@ -51,12 +51,14 @@ from dlt.extract.utils import get_data_item_format
 def data_to_sources(
     data: Any,
     pipeline: SupportsPipeline,
+    *,
     schema: Schema = None,
     table_name: str = None,
     parent_table_name: str = None,
     write_disposition: TWriteDispositionConfig = None,
     columns: TAnySchemaColumns = None,
     primary_key: TColumnNames = None,
+    table_format: TTableFormat = None,
     schema_contract: TSchemaContract = None,
 ) -> List[DltSource]:
     """Creates a list of sources for data items present in `data` and applies specified hints to all resources.
@@ -66,12 +68,13 @@ def data_to_sources(
 
     def apply_hint_args(resource: DltResource) -> None:
         resource.apply_hints(
-            table_name,
-            parent_table_name,
-            write_disposition,
-            columns,
-            primary_key,
+            table_name=table_name,
+            parent_table_name=parent_table_name,
+            write_disposition=write_disposition,
+            columns=columns,
+            primary_key=primary_key,
             schema_contract=schema_contract,
+            table_format=table_format,
         )
 
     def apply_settings(source_: DltSource) -> None:
@@ -94,7 +97,8 @@ def data_to_sources(
 
     # a list of sources or a list of resources may be passed as data
     sources: List[DltSource] = []
-    resources: List[DltResource] = []
+    resources: Dict[str, List[DltResource]] = {}
+    data_resources: List[DltResource] = []
 
     def append_data(data_item: Any) -> None:
         if isinstance(data_item, DltSource):
@@ -103,13 +107,13 @@ def data_to_sources(
                 data_item.schema = schema
             sources.append(data_item)
         elif isinstance(data_item, DltResource):
-            # do not set section to prevent source that represent a standalone resource
-            # to overwrite other standalone resources (ie. parents) in that source
-            sources.append(DltSource(effective_schema, "", [data_item]))
+            # many resources with the same name may be present
+            r_ = resources.setdefault(data_item.name, [])
+            r_.append(data_item)
         else:
             # iterator/iterable/generator
             # create resource first without table template
-            resources.append(
+            data_resources.append(
                 DltResource.from_data(data_item, name=table_name, section=pipeline.pipeline_name)
             )
 
@@ -123,9 +127,17 @@ def data_to_sources(
     else:
         append_data(data)
 
-    # add all the appended resources in one source
+    # add all appended resource instances in one source
     if resources:
-        sources.append(DltSource(effective_schema, pipeline.pipeline_name, resources))
+        # decompose into groups so at most single resource with a given name belongs to a group
+        for r_ in group_dict_of_lists(resources):
+            # do not set section to prevent source that represent a standalone resource
+            # to overwrite other standalone resources (ie. parents) in that source
+            sources.append(DltSource(effective_schema, "", list(r_.values())))
+
+    # add all the appended data-like items in one source
+    if data_resources:
+        sources.append(DltSource(effective_schema, pipeline.pipeline_name, data_resources))
 
     # apply hints and settings
     for source in sources:
@@ -170,6 +182,9 @@ def describe_extract_data(data: Any) -> List[ExtractDataInfo]:
 
 
 class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
+    original_data: Any
+    """Original data from which the extracted DltSource was created. Will be used to describe in extract info"""
+
     def __init__(
         self,
         schema_storage: SchemaStorage,
@@ -181,6 +196,7 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
         self.collector = collector
         self.schema_storage = schema_storage
         self.extract_storage = ExtractStorage(normalize_storage_config)
+        # TODO: this should be passed together with DltSource to extract()
         self.original_data: Any = original_data
         super().__init__()
 
@@ -219,7 +235,7 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
                 if name == "incremental":
                     # represent incremental as dictionary (it derives from BaseConfiguration)
                     if isinstance(hint, IncrementalResourceWrapper):
-                        hint = hint._incremental
+                        hint = hint.incremental
                     # sometimes internal incremental is not bound
                     if hint:
                         hints[name] = dict(hint)  # type: ignore[call-overload]
@@ -266,8 +282,8 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
             if resource.name not in tables_by_resources:
                 continue
             for table in tables_by_resources[resource.name]:
-                # we only need to write empty files for the top tables
-                if not table.get("parent", None):
+                # we only need to write empty files for the root tables
+                if not utils.is_nested_table(table):
                     json_extractor.write_empty_items_file(table["name"])
 
         # collect resources that received empty materialized lists and had no items
@@ -284,8 +300,8 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
                 if tables := tables_by_resources.get("resource_name"):
                     # write empty tables
                     for table in tables:
-                        # we only need to write empty files for the top tables
-                        if not table.get("parent", None):
+                        # we only need to write empty files for the root tables
+                        if not utils.is_nested_table(table):
                             json_extractor.write_empty_items_file(table["name"])
                 else:
                     table_name = json_extractor._get_static_table_name(resource, None)
@@ -297,9 +313,8 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
         load_id: str,
         source: DltSource,
         *,
-        max_parallel_items: int = None,
-        workers: int = None,
-        futures_poll_interval: float = None,
+        max_parallel_items: int,
+        workers: int,
     ) -> None:
         schema = source.schema
         collector = self.collector
@@ -319,7 +334,6 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
                     source.resources.selected_pipes,
                     max_parallel_items=max_parallel_items,
                     workers=workers,
-                    futures_poll_interval=futures_poll_interval,
                 ) as pipes:
                     left_gens = total_gens = len(pipes._sources)
                     collector.update("Resources", 0, total_gens)
@@ -369,18 +383,21 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
         source: DltSource,
         max_parallel_items: int,
         workers: int,
+        load_package_state_update: Optional[TLoadPackageState] = None,
     ) -> str:
         # generate load package to be able to commit all the sources together later
-        load_id = self.extract_storage.create_load_package(source.discover_schema())
+        load_id = self.extract_storage.create_load_package(
+            source.schema, reuse_exiting_package=True
+        )
         with Container().injectable_context(
             SourceSchemaInjectableContext(source.schema)
         ), Container().injectable_context(
             SourceInjectableContext(source)
         ), Container().injectable_context(
             LoadPackageStateInjectableContext(
-                storage=self.extract_storage.new_packages, load_id=load_id
+                load_id=load_id, storage=self.extract_storage.new_packages
             )
-        ):
+        ) as load_package:
             # inject the config section with the current source name
             with inject_section(
                 ConfigSectionContext(
@@ -388,6 +405,9 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
                     source_state_key=source.name,
                 )
             ):
+                if load_package_state_update:
+                    load_package.state.update(load_package_state_update)
+
                 # reset resource states, the `extracted` list contains all the explicit resources and all their parents
                 for resource in source.resources.extracted.values():
                     with contextlib.suppress(DataItemRequiredForDynamicTableHints):
@@ -400,16 +420,13 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
                     max_parallel_items=max_parallel_items,
                     workers=workers,
                 )
+                commit_load_package_state()
         return load_id
 
-    def commit_packages(self, pipline_state_doc: TPipelineStateDoc = None) -> None:
-        """Commits all extracted packages to normalize storage, and adds the pipeline state to the load package"""
+    def commit_packages(self) -> None:
+        """Commits all extracted packages to normalize storage"""
         # commit load packages
         for load_id, metrics in self._load_id_metrics.items():
-            if pipline_state_doc:
-                package_state = self.extract_storage.new_packages.get_load_package_state(load_id)
-                package_state["pipeline_state"] = {**pipline_state_doc, "dlt_load_id": load_id}
-                self.extract_storage.new_packages.save_load_package_state(load_id, package_state)
             self.extract_storage.commit_new_load_package(
                 load_id, self.schema_storage[metrics[0]["schema_name"]]
             )

@@ -1,7 +1,7 @@
 import os
 import asyncio
 import inspect
-from typing import List, Sequence
+from typing import ClassVar, List, Sequence
 import time
 
 import pytest
@@ -38,7 +38,7 @@ def test_next_item_mode() -> None:
             Pipe.from_data("data3", source_gen3()),
         ]
 
-    # default mode is "fifo"
+    # test both modes
     _l = list(PipeIterator.from_pipes(get_pipes(), next_item_mode="fifo"))
     # items will be in order of the pipes, nested iterator items appear inline, None triggers a bit of rotation
     assert [pi.item for pi in _l] == [1, 2, 3, 4, 10, 5, 6, 8, 7, 9, 11, 12, 13, 14, 15]
@@ -50,6 +50,11 @@ def test_next_item_mode() -> None:
 
     # round robin eval
     _l = list(PipeIterator.from_pipes(get_pipes(), next_item_mode="round_robin"))
+    # items will be in order of the pipes, nested iterator items appear inline, None triggers rotation
+    assert [pi.item for pi in _l] == [1, 12, 14, 2, 13, 15, 3, 10, 4, 11, 5, 6, 8, 9, 7]
+
+    # default is round robin, should have same result without explicit
+    _l = list(PipeIterator.from_pipes(get_pipes()))
     # items will be in order of the pipes, nested iterator items appear inline, None triggers rotation
     assert [pi.item for pi in _l] == [1, 12, 14, 2, 13, 15, 3, 10, 4, 11, 5, 6, 8, 9, 7]
 
@@ -229,6 +234,56 @@ def test_insert_remove_step() -> None:
     p.replace_gen(tx_minus)
     _l = list(PipeIterator.from_pipe(p))
     assert [pi.item for pi in _l] == [4, 8, 12]
+
+
+def test_append_transform_with_placement_affinity() -> None:
+    class FilterItemStart(FilterItem):
+        placement_affinity: ClassVar[float] = -1
+
+    class FilterItemEnd(FilterItem):
+        placement_affinity: ClassVar[float] = 1
+
+    assert FilterItemStart(lambda _: True).placement_affinity == -1
+    assert FilterItemEnd(lambda _: True).placement_affinity == 1
+
+    data = [1, 2, 3]
+    # data_iter = iter(data)
+    pp = Pipe.from_data("data", data)
+
+    pp.append_step(FilterItemEnd(lambda _: True))
+    pp.append_step(FilterItemStart(lambda _: True))
+    assert len(pp) == 3
+    # gen must always be first
+    assert pp._steps[0] == data
+    assert isinstance(pp._steps[1], FilterItemStart)
+    assert isinstance(pp._steps[2], FilterItemEnd)
+
+    def regular_lambda(item):
+        return True
+
+    pp.append_step(regular_lambda)
+    assert pp._steps[-2].__name__ == "regular_lambda"  # type: ignore[union-attr]
+
+    # explicit insert works as before, ignores affinity
+    end_aff_2 = FilterItemEnd(lambda _: True)
+    start_aff_2 = FilterItemStart(lambda _: True)
+    pp.insert_step(end_aff_2, 1)
+    assert pp._steps[1] is end_aff_2
+    pp.insert_step(start_aff_2, len(pp))
+    assert pp._steps[-1] is start_aff_2
+
+    def tx(item):
+        yield item * 2
+
+    # create pipe with transformer
+    p = Pipe.from_data("tx", tx, parent=pp)
+    p.append_step(FilterItemEnd(lambda _: True))
+    p.append_step(FilterItemStart(lambda _: True))
+    assert len(p) == 3
+    # note that in case of start affinity, tranform gets BEFORE transformer
+    assert isinstance(p._steps[0], FilterItemStart)
+    assert p._steps[1].__name__ == "tx"  # type: ignore[union-attr]
+    assert isinstance(p._steps[2], FilterItemEnd)
 
 
 def test_pipe_propagate_meta() -> None:
@@ -460,7 +515,7 @@ def test_yield_map_step() -> None:
     p = Pipe.from_data("data", [1, 2, 3])
     # this creates number of rows as passed by the data
     p.append_step(YieldMapItem(lambda item: (yield from [f"item_{x}" for x in range(item)])))
-    assert _f_items(list(PipeIterator.from_pipe(p))) == [
+    assert _f_items(list(PipeIterator.from_pipe(p, next_item_mode="fifo"))) == [
         "item_0",
         "item_0",
         "item_1",
@@ -476,7 +531,7 @@ def test_yield_map_step() -> None:
     p.append_step(
         YieldMapItem(lambda item, meta: (yield from [f"item_{meta}_{x}" for x in range(item)]))
     )
-    assert _f_items(list(PipeIterator.from_pipe(p))) == [
+    assert _f_items(list(PipeIterator.from_pipe(p, next_item_mode="fifo"))) == [
         "item_A_0",
         "item_B_0",
         "item_B_1",
@@ -503,6 +558,19 @@ def test_pipe_copy_on_fork() -> None:
     assert doc is elems[0].item
     # second fork copies
     assert elems[0].item is not elems[1].item
+
+
+def test_pipe_pass_empty_list() -> None:
+    def _gen():
+        yield []
+
+    pipe = Pipe.from_data("data", _gen())
+    elems = list(PipeIterator.from_pipe(pipe))
+    assert elems[0].item == []
+
+    pipe = Pipe.from_data("data", [[]])
+    elems = list(PipeIterator.from_pipe(pipe))
+    assert elems[0].item == []
 
 
 def test_clone_single_pipe() -> None:

@@ -1,18 +1,16 @@
 import os
 import dataclasses
 import threading
-from pathvalidate import is_valid_filepath
-from typing import Any, ClassVar, Final, List, Optional, Tuple, TYPE_CHECKING, Type, Union
 
+from typing import Any, ClassVar, Dict, Final, List, Optional, Tuple, Type, Union
+
+from pathvalidate import is_valid_filepath
 from dlt.common import logger
 from dlt.common.configuration import configspec
 from dlt.common.configuration.specs import ConnectionStringCredentials
 from dlt.common.configuration.specs.exceptions import InvalidConnectionString
-from dlt.common.destination.reference import (
-    DestinationClientDwhWithStagingConfiguration,
-    DestinationClientStagingConfiguration,
-)
-from dlt.common.typing import TSecretValue
+from dlt.common.destination.reference import DestinationClientDwhWithStagingConfiguration
+from dlt.destinations.impl.duckdb.exceptions import InvalidInMemoryDuckdbCredentials
 
 try:
     from duckdb import DuckDBPyConnection
@@ -26,11 +24,6 @@ LOCAL_STATE_KEY = "duckdb_database"
 
 @configspec(init=False)
 class DuckDbBaseCredentials(ConnectionStringCredentials):
-    password: Optional[TSecretValue] = None
-    host: Optional[str] = None
-    port: Optional[int] = None
-    database: Optional[str] = None
-
     read_only: bool = False  # open database read/write
 
     def borrow_conn(self, read_only: bool) -> Any:
@@ -40,10 +33,13 @@ class DuckDbBaseCredentials(ConnectionStringCredentials):
         if not hasattr(self, "_conn_lock"):
             self._conn_lock = threading.Lock()
 
+        config = self._get_conn_config()
         # obtain a lock because duck releases the GIL and we have refcount concurrency
         with self._conn_lock:
             if not hasattr(self, "_conn"):
-                self._conn = duckdb.connect(database=self._conn_str(), read_only=read_only)
+                self._conn = duckdb.connect(
+                    database=self._conn_str(), read_only=read_only, config=config
+                )
                 self._conn_owner = True
                 self._conn_borrows = 0
 
@@ -86,11 +82,18 @@ class DuckDbBaseCredentials(ConnectionStringCredentials):
             else:
                 raise
 
+    @property
+    def has_open_connection(self) -> bool:
+        """Returns true if connection was not yet created or no connections were borrowed in case of external connection"""
+        return not hasattr(self, "_conn") or self._conn_borrows == 0
+
+    def _get_conn_config(self) -> Dict[str, Any]:
+        return {}
+
     def _conn_str(self) -> str:
         return self.database
 
     def _delete_conn(self) -> None:
-        # print("Closing conn because is owner")
         self._conn.close()
         delattr(self, "_conn")
 
@@ -114,6 +117,9 @@ class DuckDbCredentials(DuckDbBaseCredentials):
         return self.database == ":pipeline:"
 
     def on_resolved(self) -> None:
+        if isinstance(self.database, str) and self.database == ":memory:":
+            raise InvalidInMemoryDuckdbCredentials()
+
         # do not set any paths for external database
         if self.database == ":external:":
             return

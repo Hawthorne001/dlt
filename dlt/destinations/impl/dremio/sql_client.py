@@ -1,5 +1,5 @@
 from contextlib import contextmanager, suppress
-from typing import Any, AnyStr, ClassVar, Iterator, Optional, Sequence, List
+from typing import Any, AnyStr, ClassVar, Iterator, Optional, Sequence, List, Tuple
 
 import pyarrow
 
@@ -10,7 +10,7 @@ from dlt.destinations.exceptions import (
     DatabaseUndefinedRelation,
     DatabaseTransientException,
 )
-from dlt.destinations.impl.dremio import capabilities, pydremio
+from dlt.destinations.impl.dremio import pydremio
 from dlt.destinations.impl.dremio.configuration import DremioCredentials
 from dlt.destinations.sql_client import (
     DBApiCursorImpl,
@@ -18,7 +18,8 @@ from dlt.destinations.sql_client import (
     raise_database_error,
     raise_open_connection_error,
 )
-from dlt.destinations.typing import DBApi, DBApiCursor, DBTransaction, DataFrame
+from dlt.destinations.typing import DBApi, DBTransaction, DataFrame
+from dlt.common.destination.reference import DBApiCursor
 
 
 class DremioCursorImpl(DBApiCursorImpl):
@@ -26,16 +27,27 @@ class DremioCursorImpl(DBApiCursorImpl):
 
     def df(self, chunk_size: int = None, **kwargs: Any) -> Optional[DataFrame]:
         if chunk_size is None:
-            return self.native_cursor.fetch_arrow_table().to_pandas()
+            return self.arrow(chunk_size=chunk_size).to_pandas()
         return super().df(chunk_size=chunk_size, **kwargs)
+
+    def arrow(self, chunk_size: int = None, **kwargs: Any) -> Optional[DataFrame]:
+        if chunk_size is None:
+            return self.native_cursor.fetch_arrow_table()
+        return super().arrow(chunk_size=chunk_size, **kwargs)
 
 
 class DremioSqlClient(SqlClientBase[pydremio.DremioConnection]):
     dbapi: ClassVar[DBApi] = pydremio
-    capabilities: ClassVar[DestinationCapabilitiesContext] = capabilities()
+    SENTINEL_TABLE_NAME: ClassVar[str] = "_dlt_sentinel_table"
 
-    def __init__(self, dataset_name: str, credentials: DremioCredentials) -> None:
-        super().__init__(credentials.database, dataset_name)
+    def __init__(
+        self,
+        dataset_name: str,
+        staging_dataset_name: str,
+        credentials: DremioCredentials,
+        capabilities: DestinationCapabilitiesContext,
+    ) -> None:
+        super().__init__(credentials.database, dataset_name, staging_dataset_name, capabilities)
         self._conn: Optional[pydremio.DremioConnection] = None
         self.credentials = credentials
 
@@ -99,18 +111,16 @@ class DremioSqlClient(SqlClientBase[pydremio.DremioConnection]):
                 raise DatabaseTransientException(ex)
             yield DremioCursorImpl(curr)  # type: ignore
 
-    def fully_qualified_dataset_name(self, escape: bool = True) -> str:
-        database_name = self.credentials.database
-        dataset_name = self.dataset_name
+    def catalog_name(self, escape: bool = True) -> Optional[str]:
+        database_name = self.capabilities.casefold_identifier(self.database_name)
         if escape:
             database_name = self.capabilities.escape_identifier(database_name)
-            dataset_name = self.capabilities.escape_identifier(dataset_name)
-        return f"{database_name}.{dataset_name}"
+        return database_name
 
-    def make_qualified_table_name(self, table_name: str, escape: bool = True) -> str:
-        if escape:
-            table_name = self.capabilities.escape_identifier(table_name)
-        return f"{self.fully_qualified_dataset_name(escape=escape)}.{table_name}"
+    def _get_information_schema_components(self, *tables: str) -> Tuple[str, str, List[str]]:
+        components = super()._get_information_schema_components(*tables)
+        # catalog is always DREMIO but schema contains "database" prefix 🤷
+        return ("DREMIO", self.fully_qualified_dataset_name(escape=False), components[2])
 
     @classmethod
     def _make_database_exception(cls, ex: Exception) -> Exception:
@@ -132,19 +142,26 @@ class DremioSqlClient(SqlClientBase[pydremio.DremioConnection]):
         return isinstance(ex, (pyarrow.lib.ArrowInvalid, pydremio.MalformedQueryError))
 
     def create_dataset(self) -> None:
-        pass
+        # We create a sentinel table which defines wether we consider the dataset created
+        sentinel_table_name = self.make_qualified_table_name(self.SENTINEL_TABLE_NAME)
+        self.execute_sql(f"CREATE TABLE {sentinel_table_name} (_dlt_id BIGINT);")
 
     def _get_table_names(self) -> List[str]:
         query = """
             SELECT TABLE_NAME
             FROM INFORMATION_SCHEMA."TABLES"
-            WHERE TABLE_CATALOG = 'DREMIO' AND TABLE_SCHEMA = %s
+            WHERE TABLE_CATALOG = %s AND TABLE_SCHEMA = %s
             """
-        db_params = [self.fully_qualified_dataset_name(escape=False)]
-        tables = self.execute_sql(query, *db_params) or []
+        catalog_name, schema_name, _ = self._get_information_schema_components()
+        tables = self.execute_sql(query, catalog_name, schema_name) or []
         return [table[0] for table in tables]
 
     def drop_dataset(self) -> None:
+        # drop sentinel table
+        sentinel_table_name = self.make_qualified_table_name(self.SENTINEL_TABLE_NAME)
+        # must exist or we get undefined relation exception
+        self.execute_sql(f"DROP TABLE {sentinel_table_name}")
+
         table_names = self._get_table_names()
         for table_name in table_names:
             full_table_name = self.make_qualified_table_name(table_name)

@@ -1,61 +1,19 @@
-from typing import Any, Iterator, List, Sequence, TYPE_CHECKING, Callable
 import pytest
 
-import dlt
-from dlt.common.destination.reference import WithStagingDataset
-
-from dlt.common.configuration.container import Container
-from dlt.common.pipeline import LoadInfo, PipelineContext
-
-from tests.load.utils import DestinationTestConfiguration, destinations_configs
-
-if TYPE_CHECKING:
-    from dlt.destinations.impl.filesystem.filesystem import FilesystemClient
+from tests.load.utils import DestinationTestConfiguration
 
 REPLACE_STRATEGIES = ["truncate-and-insert", "insert-from-staging", "staging-optimized"]
 
 
-@pytest.fixture(autouse=True)
-def drop_pipeline(request) -> Iterator[None]:
-    yield
-    if "no_load" in request.keywords:
-        return
-    drop_active_pipeline_data()
-
-
-def drop_active_pipeline_data() -> None:
-    """Drops all the datasets for currently active pipeline, wipes the working folder and then deactivated it."""
-    if Container()[PipelineContext].is_active():
-        # take existing pipeline
-        p = dlt.pipeline()
-
-        def _drop_dataset(schema_name: str) -> None:
-            with p.destination_client(schema_name) as client:
-                try:
-                    client.drop_storage()
-                    print("dropped")
-                except Exception as exc:
-                    print(exc)
-                if isinstance(client, WithStagingDataset):
-                    with client.with_staging_dataset():
-                        try:
-                            client.drop_storage()
-                            print("staging dropped")
-                        except Exception as exc:
-                            print(exc)
-
-        # drop_func = _drop_dataset_fs if _is_filesystem(p) else _drop_dataset_sql
-        # take all schemas and if destination was set
-        if p.destination:
-            if p.config.use_single_dataset:
-                # drop just the dataset for default schema
-                if p.default_schema_name:
-                    _drop_dataset(p.default_schema_name)
-            else:
-                # for each schema, drop the dataset
-                for schema_name in p.schema_names:
-                    _drop_dataset(schema_name)
-
-        # p._wipe_working_folder()
-        # deactivate context
-        Container()[PipelineContext].deactivate()
+def skip_if_unsupported_replace_strategy(
+    destination_config: DestinationTestConfiguration, replace_strategy: str
+):
+    """Skip test if destination does not support the given replace strategy."""
+    supported_replace_strategies = (
+        destination_config.raw_capabilities().supported_replace_strategies
+    )
+    if not supported_replace_strategies or replace_strategy not in supported_replace_strategies:
+        pytest.skip(
+            f"Destination {destination_config.name} does not support the replace strategy"
+            f" {replace_strategy}"
+        )

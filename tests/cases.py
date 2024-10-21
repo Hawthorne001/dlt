@@ -1,3 +1,4 @@
+import datetime  # noqa: I251
 import hashlib
 from typing import Dict, List, Any, Sequence, Tuple, Literal, Union
 import base64
@@ -5,6 +6,7 @@ from hexbytes import HexBytes
 from copy import deepcopy
 from string import ascii_lowercase
 import random
+import secrets
 
 from dlt.common import Decimal, pendulum, json
 from dlt.common.data_types import TDataType
@@ -74,7 +76,7 @@ TABLE_UPDATE: List[TColumnSchema] = [
     {"name": "col6", "data_type": "decimal", "nullable": False},
     {"name": "col7", "data_type": "binary", "nullable": False},
     {"name": "col8", "data_type": "wei", "nullable": False},
-    {"name": "col9", "data_type": "complex", "nullable": False, "variant": True},
+    {"name": "col9", "data_type": "json", "nullable": False, "variant": True},
     {"name": "col10", "data_type": "date", "nullable": False},
     {"name": "col11", "data_type": "time", "nullable": False},
     {"name": "col1_null", "data_type": "bigint", "nullable": True},
@@ -85,7 +87,7 @@ TABLE_UPDATE: List[TColumnSchema] = [
     {"name": "col6_null", "data_type": "decimal", "nullable": True},
     {"name": "col7_null", "data_type": "binary", "nullable": True},
     {"name": "col8_null", "data_type": "wei", "nullable": True},
-    {"name": "col9_null", "data_type": "complex", "nullable": True, "variant": True},
+    {"name": "col9_null", "data_type": "json", "nullable": True, "variant": True},
     {"name": "col10_null", "data_type": "date", "nullable": True},
     {"name": "col11_null", "data_type": "time", "nullable": True},
     {"name": "col1_precision", "data_type": "bigint", "precision": 16, "nullable": False},
@@ -113,7 +115,7 @@ TABLE_ROW_ALL_DATA_TYPES = {
     "col7": b"binary data \n \r ",
     "col8": 2**56 + 92093890840,
     "col9": {
-        "complex": [1, 2, 3, "a"],
+        "nested": [1, 2, 3, "a"],
         "link": (
             "?commen\ntU\nrn=urn%3Ali%3Acomment%3A%28acti\012 \6"
             " \\vity%3A69'08444473\n\n551163392%2C6n \r 9085"
@@ -173,12 +175,12 @@ TABLE_UPDATE_ALL_INT_PRECISIONS_COLUMNS: TTableSchemaColumns = {
 
 def table_update_and_row(
     exclude_types: Sequence[TDataType] = None, exclude_columns: Sequence[str] = None
-) -> Tuple[TTableSchemaColumns, StrAny]:
+) -> Tuple[TTableSchemaColumns, Dict[str, Any]]:
     """Get a table schema and a row with all possible data types.
     Optionally exclude some data types from the schema and row.
     """
     column_schemas = deepcopy(TABLE_UPDATE_COLUMNS_SCHEMA)
-    data_row = deepcopy(TABLE_ROW_ALL_DATA_TYPES)
+    data_row = deepcopy(TABLE_ROW_ALL_DATA_TYPES_DATETIMES)
     exclude_col_names = list(exclude_columns or [])
     if exclude_types:
         exclude_col_names.extend(
@@ -192,15 +194,18 @@ def table_update_and_row(
 
 def assert_all_data_types_row(
     db_row: Union[List[Any], TDataItems],
-    parse_complex_strings: bool = False,
+    expected_row: Dict[str, Any] = None,
+    parse_json_strings: bool = False,
     allow_base64_binary: bool = False,
     timestamp_precision: int = 6,
     schema: TTableSchemaColumns = None,
     expect_filtered_null_columns=False,
+    allow_string_binary: bool = False,
 ) -> None:
     # content must equal
     # print(db_row)
     schema = schema or TABLE_UPDATE_COLUMNS_SCHEMA
+    expected_row = expected_row or TABLE_ROW_ALL_DATA_TYPES_DATETIMES
 
     # Include only columns requested in schema
     if isinstance(db_row, dict):
@@ -208,21 +213,24 @@ def assert_all_data_types_row(
     else:
         db_mapping = {col_name: db_row[i] for i, col_name in enumerate(schema)}
 
-    expected_rows = {key: value for key, value in TABLE_ROW_ALL_DATA_TYPES.items() if key in schema}
+    expected_rows = {key: value for key, value in expected_row.items() if key in schema}
     # prepare date to be compared: convert into pendulum instance, adjust microsecond precision
     if "col4" in expected_rows:
-        parsed_date = pendulum.instance(db_mapping["col4"])
+        parsed_date = ensure_pendulum_datetime((db_mapping["col4"]))
         db_mapping["col4"] = reduce_pendulum_datetime_precision(parsed_date, timestamp_precision)
         expected_rows["col4"] = reduce_pendulum_datetime_precision(
             ensure_pendulum_datetime(expected_rows["col4"]),  # type: ignore[arg-type]
             timestamp_precision,
         )
     if "col4_precision" in expected_rows:
-        parsed_date = pendulum.instance(db_mapping["col4_precision"])
+        parsed_date = ensure_pendulum_datetime((db_mapping["col4_precision"]))
         db_mapping["col4_precision"] = reduce_pendulum_datetime_precision(parsed_date, 3)
         expected_rows["col4_precision"] = reduce_pendulum_datetime_precision(
             ensure_pendulum_datetime(expected_rows["col4_precision"]), 3  # type: ignore[arg-type]
         )
+
+    if "col10" in expected_rows:
+        db_mapping["col10"] = ensure_pendulum_date(db_mapping["col10"])
 
     if "col11" in expected_rows:
         expected_rows["col11"] = reduce_pendulum_datetime_precision(
@@ -245,11 +253,21 @@ def assert_all_data_types_row(
                         db_mapping[binary_col]
                     )  # redshift returns binary as hex string
                 except ValueError:
-                    if not allow_base64_binary:
+                    if allow_string_binary:
+                        db_mapping[binary_col] = db_mapping[binary_col].encode("utf-8")
+                    elif allow_base64_binary:
+                        db_mapping[binary_col] = base64.b64decode(
+                            db_mapping[binary_col], validate=True
+                        )
+                    else:
                         raise
-                    db_mapping[binary_col] = base64.b64decode(db_mapping[binary_col], validate=True)
             else:
                 db_mapping[binary_col] = bytes(db_mapping[binary_col])
+
+    # `delta` table format stores `wei` type as string
+    if "col8" in db_mapping:
+        if isinstance(db_mapping["col8"], str):
+            db_mapping["col8"] = int(db_mapping["col8"])
 
     # redshift and bigquery return strings from structured fields
     if "col9" in db_mapping:
@@ -257,14 +275,14 @@ def assert_all_data_types_row(
             # then it must be json
             db_mapping["col9"] = json.loads(db_mapping["col9"])
         # parse again
-        if parse_complex_strings and isinstance(db_mapping["col9"], str):
+        if parse_json_strings and isinstance(db_mapping["col9"], str):
             # then it must be json
             db_mapping["col9"] = json.loads(db_mapping["col9"])
 
-    if "col10" in db_mapping:
-        db_mapping["col10"] = db_mapping["col10"].isoformat()
+    # if "col10" in db_mapping:
+    #     db_mapping["col10"] = db_mapping["col10"].isoformat()
     if "col11" in db_mapping:
-        db_mapping["col11"] = db_mapping["col11"].isoformat()
+        db_mapping["col11"] = ensure_pendulum_time(db_mapping["col11"]).isoformat()
 
     if expect_filtered_null_columns:
         for key, expected in expected_rows.items():
@@ -285,9 +303,12 @@ def arrow_table_all_data_types(
     include_time: bool = True,
     include_binary: bool = True,
     include_decimal: bool = True,
+    include_decimal_default_precision: bool = False,
+    include_decimal_arrow_max_precision: bool = False,
     include_date: bool = True,
     include_not_normalized_name: bool = True,
     include_name_clash: bool = False,
+    include_null: bool = True,
     num_rows: int = 3,
     tz="UTC",
 ) -> Tuple[Any, List[Dict[str, Any]], Dict[str, List[Any]]]:
@@ -299,17 +320,19 @@ def arrow_table_all_data_types(
     import numpy as np
 
     data = {
-        "string": [random.choice(ascii_lowercase) + "\"'\\🦆\n\r" for _ in range(num_rows)],
+        "string": [secrets.token_urlsafe(8) + "\"'\\🦆\n\r" for _ in range(num_rows)],
         "float": [round(random.uniform(0, 100), 4) for _ in range(num_rows)],
         "int": [random.randrange(0, 100) for _ in range(num_rows)],
         "datetime": pd.date_range("2021-01-01T01:02:03.1234", periods=num_rows, tz=tz, unit="us"),
         "bool": [random.choice([True, False]) for _ in range(num_rows)],
         "string_null": [random.choice(ascii_lowercase) for _ in range(num_rows - 1)] + [None],
-        "float_null": [round(random.uniform(0, 100), 5) for _ in range(num_rows - 1)] + [
+        "float_null": [round(random.uniform(0, 100), 4) for _ in range(num_rows - 1)] + [
             None
         ],  # decrease precision
-        "null": pd.Series([None for _ in range(num_rows)]),
     }
+
+    if include_null:
+        data["null"] = pd.Series([None for _ in range(num_rows)])
 
     if include_name_clash:
         data["pre Normalized Column"] = [random.choice(ascii_lowercase) for _ in range(num_rows)]
@@ -322,7 +345,18 @@ def arrow_table_all_data_types(
         data["json"] = [{"a": random.randrange(0, 100)} for _ in range(num_rows)]
 
     if include_time:
-        data["time"] = pd.date_range("2021-01-01", periods=num_rows, tz="UTC").time
+        # data["time"] = pd.date_range("2021-01-01", periods=num_rows, tz="UTC").time
+        # data["time"] = pd.date_range("2021-01-01T01:02:03.1234", periods=num_rows, tz=tz, unit="us").time
+        # random time objects with different hours/minutes/seconds/microseconds
+        data["time"] = [
+            datetime.time(
+                random.randrange(0, 24),
+                random.randrange(0, 60),
+                random.randrange(0, 60),
+                random.randrange(0, 1000000),
+            )
+            for _ in range(num_rows)
+        ]
 
     if include_binary:
         # "binary": [hashlib.sha3_256(random.choice(ascii_lowercase).encode()).digest() for _ in range(num_rows)],
@@ -330,6 +364,20 @@ def arrow_table_all_data_types(
 
     if include_decimal:
         data["decimal"] = [Decimal(str(round(random.uniform(0, 100), 4))) for _ in range(num_rows)]
+
+    if include_decimal_default_precision:
+        from dlt.common.arithmetics import DEFAULT_NUMERIC_PRECISION
+
+        data["decimal_default_precision"] = [
+            Decimal(int("1" * DEFAULT_NUMERIC_PRECISION)) for _ in range(num_rows)
+        ]
+
+    if include_decimal_arrow_max_precision:
+        from dlt.common.libs.pyarrow import ARROW_DECIMAL_MAX_PRECISION
+
+        data["decimal_arrow_max_precision"] = [
+            Decimal(int("1" * ARROW_DECIMAL_MAX_PRECISION)) for _ in range(num_rows)
+        ]
 
     if include_date:
         data["date"] = pd.date_range("2021-01-01", periods=num_rows, tz=tz).date
@@ -344,7 +392,7 @@ def arrow_table_all_data_types(
                 "Pre Normalized Column": "pre_normalized_column",
             }
         )
-        .drop(columns=["null"])
+        .drop(columns=(["null"] if include_null else []))
         .to_dict("records")
     )
     if object_format == "object":

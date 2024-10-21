@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 import dataclasses
 from importlib import import_module
+from contextlib import contextmanager
+
 from types import TracebackType
 from typing import (
     Callable,
@@ -18,42 +20,67 @@ from typing import (
     Any,
     TypeVar,
     Generic,
-    Final,
+    Generator,
+    TYPE_CHECKING,
+    Protocol,
+    Tuple,
+    AnyStr,
 )
+from typing_extensions import Annotated
 import datetime  # noqa: 251
-from copy import deepcopy
 import inspect
 
-from dlt.common import logger
-from dlt.common.schema import Schema, TTableSchema, TSchemaTables
-from dlt.common.schema.typing import MERGE_STRATEGIES
-from dlt.common.schema.exceptions import SchemaException
-from dlt.common.schema.utils import (
-    get_write_disposition,
-    get_table_format,
-    get_columns_names_with_prop,
-    has_column_with_prop,
-    get_first_column_name_with_prop,
+from dlt.common import logger, pendulum
+
+from dlt.common.configuration.specs.base_configuration import extract_inner_hint
+from dlt.common.destination.typing import PreparedTableSchema
+from dlt.common.destination.utils import verify_schema_capabilities, verify_supported_data_types
+from dlt.common.exceptions import TerminalException
+from dlt.common.metrics import LoadJobMetrics
+from dlt.common.normalizers.naming import NamingConvention
+from dlt.common.schema.typing import TTableSchemaColumns
+
+from dlt.common.schema import Schema, TSchemaTables, TTableSchema
+from dlt.common.schema.typing import (
+    C_DLT_LOAD_ID,
+    TLoaderReplaceStrategy,
 )
-from dlt.common.configuration import configspec, resolve_configuration, known_sections
+from dlt.common.schema.utils import fill_hints_from_parent_and_clone_table
+
+from dlt.common.configuration import configspec, resolve_configuration, known_sections, NotResolved
 from dlt.common.configuration.specs import BaseConfiguration, CredentialsConfiguration
-from dlt.common.configuration.accessors import config
 from dlt.common.destination.capabilities import DestinationCapabilitiesContext
 from dlt.common.destination.exceptions import (
-    IdentifierTooLongException,
     InvalidDestinationReference,
     UnknownDestinationModule,
     DestinationSchemaTampered,
+    DestinationTransientException,
 )
-from dlt.common.schema.utils import is_complete_column
 from dlt.common.schema.exceptions import UnknownTableException
 from dlt.common.storages import FileStorage
 from dlt.common.storages.load_storage import ParsedLoadJobFileName
+from dlt.common.storages.load_package import LoadJobInfo, TPipelineStateDoc
+from dlt.common.exceptions import MissingDependencyException
 
-TLoaderReplaceStrategy = Literal["truncate-and-insert", "insert-from-staging", "staging-optimized"]
+
 TDestinationConfig = TypeVar("TDestinationConfig", bound="DestinationClientConfiguration")
 TDestinationClient = TypeVar("TDestinationClient", bound="JobClientBase")
 TDestinationDwhClient = TypeVar("TDestinationDwhClient", bound="DestinationClientDwhConfiguration")
+TDatasetType = Literal["dbapi", "ibis"]
+
+
+DEFAULT_FILE_LAYOUT = "{table_name}/{load_id}.{file_id}.{ext}"
+
+if TYPE_CHECKING:
+    try:
+        from dlt.common.libs.pandas import DataFrame
+        from dlt.common.libs.pyarrow import Table as ArrowTable
+    except MissingDependencyException:
+        DataFrame = Any
+        ArrowTable = Any
+else:
+    DataFrame = Any
+    ArrowTable = Any
 
 
 class StorageSchemaInfo(NamedTuple):
@@ -64,19 +91,88 @@ class StorageSchemaInfo(NamedTuple):
     inserted_at: datetime.datetime
     schema: str
 
+    @classmethod
+    def from_normalized_mapping(
+        cls, normalized_doc: Dict[str, Any], naming_convention: NamingConvention
+    ) -> "StorageSchemaInfo":
+        """Instantiate this class from mapping where keys are normalized according to given naming convention
 
-class StateInfo(NamedTuple):
+        Args:
+            normalized_doc: Mapping with normalized keys (e.g. {Version: ..., SchemaName: ...})
+            naming_convention: Naming convention that was used to normalize keys
+
+        Returns:
+            StorageSchemaInfo: Instance of this class
+        """
+        return cls(
+            version_hash=normalized_doc[naming_convention.normalize_identifier("version_hash")],
+            schema_name=normalized_doc[naming_convention.normalize_identifier("schema_name")],
+            version=normalized_doc[naming_convention.normalize_identifier("version")],
+            engine_version=normalized_doc[naming_convention.normalize_identifier("engine_version")],
+            inserted_at=normalized_doc[naming_convention.normalize_identifier("inserted_at")],
+            schema=normalized_doc[naming_convention.normalize_identifier("schema")],
+        )
+
+    def to_normalized_mapping(self, naming_convention: NamingConvention) -> Dict[str, Any]:
+        """Convert this instance to mapping where keys are normalized according to given naming convention
+
+        Args:
+            naming_convention: Naming convention that should be used to normalize keys
+
+        Returns:
+            Dict[str, Any]: Mapping with normalized keys (e.g. {Version: ..., SchemaName: ...})
+        """
+        return {
+            naming_convention.normalize_identifier(key): value
+            for key, value in self._asdict().items()
+        }
+
+
+@dataclasses.dataclass
+class StateInfo:
     version: int
     engine_version: int
     pipeline_name: str
     state: str
     created_at: datetime.datetime
-    dlt_load_id: str = None
+    version_hash: Optional[str] = None
+    _dlt_load_id: Optional[str] = None
+
+    def as_doc(self) -> TPipelineStateDoc:
+        doc: TPipelineStateDoc = dataclasses.asdict(self)  # type: ignore[assignment]
+        if self._dlt_load_id is None:
+            doc.pop(C_DLT_LOAD_ID)  # type: ignore[misc]
+        if self.version_hash is None:
+            doc.pop("version_hash")
+        return doc
+
+    @classmethod
+    def from_normalized_mapping(
+        cls, normalized_doc: Dict[str, Any], naming_convention: NamingConvention
+    ) -> "StateInfo":
+        """Instantiate this class from mapping where keys are normalized according to given naming convention
+
+        Args:
+            normalized_doc: Mapping with normalized keys (e.g. {Version: ..., PipelineName: ...})
+            naming_convention: Naming convention that was used to normalize keys
+
+        Returns:
+            StateInfo: Instance of this class
+        """
+        return cls(
+            version=normalized_doc[naming_convention.normalize_identifier("version")],
+            engine_version=normalized_doc[naming_convention.normalize_identifier("engine_version")],
+            pipeline_name=normalized_doc[naming_convention.normalize_identifier("pipeline_name")],
+            state=normalized_doc[naming_convention.normalize_identifier("state")],
+            created_at=normalized_doc[naming_convention.normalize_identifier("created_at")],
+            version_hash=normalized_doc.get(naming_convention.normalize_identifier("version_hash")),
+            _dlt_load_id=normalized_doc.get(naming_convention.normalize_identifier(C_DLT_LOAD_ID)),
+        )
 
 
 @configspec
 class DestinationClientConfiguration(BaseConfiguration):
-    destination_type: Final[str] = dataclasses.field(
+    destination_type: Annotated[str, NotResolved()] = dataclasses.field(
         default=None, init=False, repr=False, compare=False
     )  # which destination to load data to
     credentials: Optional[CredentialsConfiguration] = None
@@ -96,21 +192,44 @@ class DestinationClientConfiguration(BaseConfiguration):
     def on_resolved(self) -> None:
         self.destination_name = self.destination_name or self.destination_type
 
+    @classmethod
+    def credentials_type(
+        cls, config: "DestinationClientConfiguration" = None
+    ) -> Type[CredentialsConfiguration]:
+        """Figure out credentials type, using hint resolvers for dynamic types
+
+        For correct type resolution of filesystem, config should have bucket_url populated
+        """
+        key = "credentials"
+        type_ = cls.get_resolvable_fields()[key]
+        if key in cls.__hint_resolvers__ and config is not None:
+            try:
+                # Type hint for this field is created dynamically
+                type_ = cls.__hint_resolvers__[key](config)
+            except Exception:
+                # we suppress failed hint resolutions
+                pass
+        return extract_inner_hint(type_)
+
 
 @configspec
 class DestinationClientDwhConfiguration(DestinationClientConfiguration):
     """Configuration of a destination that supports datasets/schemas"""
 
-    dataset_name: Final[str] = dataclasses.field(
+    dataset_name: Annotated[str, NotResolved()] = dataclasses.field(
         default=None, init=False, repr=False, compare=False
-    )  # dataset must be final so it is not configurable
+    )  # dataset cannot be resolved
     """dataset name in the destination to load data to, for schemas that are not default schema, it is used as dataset prefix"""
-    default_schema_name: Final[Optional[str]] = dataclasses.field(
+    default_schema_name: Annotated[Optional[str], NotResolved()] = dataclasses.field(
         default=None, init=False, repr=False, compare=False
     )
     """name of default schema to be used to name effective dataset to load data to"""
     replace_strategy: TLoaderReplaceStrategy = "truncate-and-insert"
     """How to handle replace disposition for this destination, can be classic or staging"""
+    staging_dataset_name_layout: str = "%s_staging"
+    """Layout for staging dataset, where %s is replaced with dataset name. placeholder is optional"""
+    enable_dataset_name_normalization: bool = True
+    """Whether to normalize the dataset name. Affects staging dataset as well."""
 
     def _bind_dataset_name(
         self: TDestinationDwhClient, dataset_name: str, default_schema_name: str = None
@@ -119,8 +238,8 @@ class DestinationClientDwhConfiguration(DestinationClientConfiguration):
 
         This method is intended to be used internally.
         """
-        self.dataset_name = dataset_name  # type: ignore[misc]
-        self.default_schema_name = default_schema_name  # type: ignore[misc]
+        self.dataset_name = dataset_name
+        self.default_schema_name = default_schema_name
         return self
 
     def normalize_dataset_name(self, schema: Schema) -> str:
@@ -128,21 +247,44 @@ class DestinationClientDwhConfiguration(DestinationClientConfiguration):
 
         If default schema name is None or equals schema.name, the schema suffix is skipped.
         """
-        if not schema.name:
+        dataset_name = self._make_dataset_name(schema.name)
+        if not dataset_name:
+            return dataset_name
+        else:
+            return (
+                schema.naming.normalize_table_identifier(dataset_name)
+                if self.enable_dataset_name_normalization
+                else dataset_name
+            )
+
+    def normalize_staging_dataset_name(self, schema: Schema) -> str:
+        """Builds staging dataset name out of dataset_name and staging_dataset_name_layout."""
+        if "%s" in self.staging_dataset_name_layout:
+            # if dataset name is empty, staging dataset name is also empty
+            dataset_name = self._make_dataset_name(schema.name)
+            if not dataset_name:
+                return dataset_name
+            # fill the placeholder
+            dataset_name = self.staging_dataset_name_layout % dataset_name
+        else:
+            # no placeholder, then layout is a full name. so you can have a single staging dataset
+            dataset_name = self.staging_dataset_name_layout
+
+        return (
+            schema.naming.normalize_table_identifier(dataset_name)
+            if self.enable_dataset_name_normalization
+            else dataset_name
+        )
+
+    def _make_dataset_name(self, schema_name: str) -> str:
+        if not schema_name:
             raise ValueError("schema_name is None or empty")
 
         # if default schema is None then suffix is not added
-        if self.default_schema_name is not None and schema.name != self.default_schema_name:
-            # also normalize schema name. schema name is Python identifier and here convention may be different
-            return schema.naming.normalize_table_identifier(
-                (self.dataset_name or "") + "_" + schema.name
-            )
+        if self.default_schema_name is not None and schema_name != self.default_schema_name:
+            return (self.dataset_name or "") + "_" + schema_name
 
-        return (
-            self.dataset_name
-            if not self.dataset_name
-            else schema.naming.normalize_table_identifier(self.dataset_name)
-        )
+        return self.dataset_name
 
 
 @configspec
@@ -152,10 +294,10 @@ class DestinationClientStagingConfiguration(DestinationClientDwhConfiguration):
     Also supports datasets and can act as standalone destination.
     """
 
-    as_staging: bool = False
+    as_staging_destination: bool = False
     bucket_url: str = None
     # layout of the destination files
-    layout: str = "{table_name}/{load_id}.{file_id}.{ext}"
+    layout: str = DEFAULT_FILE_LAYOUT
 
 
 @configspec
@@ -164,13 +306,63 @@ class DestinationClientDwhWithStagingConfiguration(DestinationClientDwhConfigura
 
     staging_config: Optional[DestinationClientStagingConfiguration] = None
     """configuration of the staging, if present, injected at runtime"""
+    truncate_tables_on_staging_destination_before_load: bool = True
+    """If dlt should truncate the tables on staging destination before loading data."""
 
 
-TLoadJobState = Literal["running", "failed", "retry", "completed"]
+TLoadJobState = Literal["ready", "running", "failed", "retry", "completed"]
 
 
-class LoadJob:
-    """Represents a job that loads a single file
+class LoadJob(ABC):
+    """
+    A stateful load job, represents one job file
+    """
+
+    def __init__(self, file_path: str) -> None:
+        self._file_path = file_path
+        self._file_name = FileStorage.get_file_name_from_file_path(file_path)
+        # NOTE: we only accept a full filepath in the constructor
+        assert self._file_name != self._file_path
+        self._parsed_file_name = ParsedLoadJobFileName.parse(self._file_name)
+        self._started_at: pendulum.DateTime = None
+        self._finished_at: pendulum.DateTime = None
+
+    def job_id(self) -> str:
+        """The job id that is derived from the file name and does not changes during job lifecycle"""
+        return self._parsed_file_name.job_id()
+
+    def file_name(self) -> str:
+        """A name of the job file"""
+        return self._file_name
+
+    def job_file_info(self) -> ParsedLoadJobFileName:
+        return self._parsed_file_name
+
+    @abstractmethod
+    def state(self) -> TLoadJobState:
+        """Returns current state. Should poll external resource if necessary."""
+        pass
+
+    @abstractmethod
+    def exception(self) -> str:
+        """The exception associated with failed or retry states"""
+        pass
+
+    def metrics(self) -> Optional[LoadJobMetrics]:
+        """Returns job execution metrics"""
+        return LoadJobMetrics(
+            self._parsed_file_name.job_id(),
+            self._file_path,
+            self._parsed_file_name.table_name,
+            self._started_at,
+            self._finished_at,
+            self.state(),
+            None,
+        )
+
+
+class RunnableLoadJob(LoadJob, ABC):
+    """Represents a runnable job that loads a single file
 
     Each job starts in "running" state and ends in one of terminal states: "retry", "failed" or "completed".
     Each job is uniquely identified by a file name. The file is guaranteed to exist in "running" state. In terminal state, the file may not be present.
@@ -181,39 +373,86 @@ class LoadJob:
     immediately transition job into "failed" or "retry" state respectively.
     """
 
-    def __init__(self, file_name: str) -> None:
+    def __init__(self, file_path: str) -> None:
         """
         File name is also a job id (or job id is deterministically derived) so it must be globally unique
         """
         # ensure file name
-        assert file_name == FileStorage.get_file_name_from_file_path(file_name)
-        self._file_name = file_name
-        self._parsed_file_name = ParsedLoadJobFileName.parse(file_name)
+        super().__init__(file_path)
+        self._state: TLoadJobState = "ready"
+        self._exception: BaseException = None
+
+        # variables needed by most jobs, set by the loader in set_run_vars
+        self._schema: Schema = None
+        self._load_table: PreparedTableSchema = None
+        self._load_id: str = None
+        self._job_client: "JobClientBase" = None
+
+    def set_run_vars(self, load_id: str, schema: Schema, load_table: PreparedTableSchema) -> None:
+        """
+        called by the loader right before the job is run
+        """
+        self._load_id = load_id
+        self._schema = schema
+        self._load_table = load_table
+
+    @property
+    def load_table_name(self) -> str:
+        return self._load_table["name"]
+
+    def run_managed(
+        self,
+        job_client: "JobClientBase",
+    ) -> None:
+        """
+        wrapper around the user implemented run method
+        """
+        # only jobs that are not running or have not reached a final state
+        # may be started
+        assert self._state in ("ready", "retry")
+        self._job_client = job_client
+
+        # filepath is now moved to running
+        try:
+            self._state = "running"
+            self._started_at = pendulum.now()
+            self._job_client.prepare_load_job_execution(self)
+            self.run()
+            self._state = "completed"
+        except (TerminalException, AssertionError) as e:
+            self._state = "failed"
+            self._exception = e
+            logger.exception(f"Terminal exception in job {self.job_id()} in file {self._file_path}")
+        except (DestinationTransientException, Exception) as e:
+            self._state = "retry"
+            self._exception = e
+            logger.exception(
+                f"Transient exception in job {self.job_id()} in file {self._file_path}"
+            )
+        finally:
+            self._finished_at = pendulum.now()
+            # sanity check
+            assert self._state in ("completed", "retry", "failed")
 
     @abstractmethod
+    def run(self) -> None:
+        """
+        run the actual job, this will be executed on a thread and should be implemented by the user
+        exception will be handled outside of this function
+        """
+        raise NotImplementedError()
+
     def state(self) -> TLoadJobState:
         """Returns current state. Should poll external resource if necessary."""
-        pass
+        return self._state
 
-    def file_name(self) -> str:
-        """A name of the job file"""
-        return self._file_name
-
-    def job_id(self) -> str:
-        """The job id that is derived from the file name and does not changes during job lifecycle"""
-        return self._parsed_file_name.job_id()
-
-    def job_file_info(self) -> ParsedLoadJobFileName:
-        return self._parsed_file_name
-
-    @abstractmethod
     def exception(self) -> str:
         """The exception associated with failed or retry states"""
-        pass
+        return str(self._exception)
 
 
-class NewLoadJob(LoadJob):
-    """Adds a trait that allows to save new job file"""
+class FollowupJobRequest:
+    """Base class for follow up jobs that should be created"""
 
     @abstractmethod
     def new_file_path(self) -> str:
@@ -221,44 +460,86 @@ class NewLoadJob(LoadJob):
         pass
 
 
-class FollowupJob:
-    """Adds a trait that allows to create a followup job"""
+class HasFollowupJobs:
+    """Adds a trait that allows to create single or table chain followup jobs"""
 
-    def create_followup_jobs(self, final_state: TLoadJobState) -> List[NewLoadJob]:
-        """Return list of new jobs. `final_state` is state to which this job transits"""
+    def create_followup_jobs(self, final_state: TLoadJobState) -> List[FollowupJobRequest]:
+        """Return list of jobs requests for jobs that should be created. `final_state` is state to which this job transits"""
         return []
 
 
-class DoNothingJob(LoadJob):
-    """The most lazy class of dlt"""
+class SupportsReadableRelation(Protocol):
+    """A readable relation retrieved from a destination that supports it"""
 
-    def __init__(self, file_path: str) -> None:
-        super().__init__(FileStorage.get_file_name_from_file_path(file_path))
+    schema_columns: TTableSchemaColumns
+    """Known dlt table columns for this relation"""
 
-    def state(self) -> TLoadJobState:
-        # this job is always done
-        return "completed"
+    def df(self, chunk_size: int = None) -> Optional[DataFrame]:
+        """Fetches the results as data frame. For large queries the results may be chunked
 
-    def exception(self) -> str:
-        # this part of code should be never reached
-        raise NotImplementedError()
+        Fetches the results into a data frame. The default implementation uses helpers in `pandas.io.sql` to generate Pandas data frame.
+        This function will try to use native data frame generation for particular destination. For `BigQuery`: `QueryJob.to_dataframe` is used.
+        For `duckdb`: `DuckDBPyConnection.df'
+
+        Args:
+            chunk_size (int, optional): Will chunk the results into several data frames. Defaults to None
+            **kwargs (Any): Additional parameters which will be passed to native data frame generation function.
+
+        Returns:
+            Optional[DataFrame]: A data frame with query results. If chunk_size > 0, None will be returned if there is no more data in results
+        """
+        ...
+
+    def arrow(self, chunk_size: int = None) -> Optional[ArrowTable]: ...
+
+    def iter_df(self, chunk_size: int) -> Generator[DataFrame, None, None]: ...
+
+    def iter_arrow(self, chunk_size: int) -> Generator[ArrowTable, None, None]: ...
+
+    def fetchall(self) -> List[Tuple[Any, ...]]: ...
+
+    def fetchmany(self, chunk_size: int) -> List[Tuple[Any, ...]]: ...
+
+    def iter_fetch(self, chunk_size: int) -> Generator[List[Tuple[Any, ...]], Any, Any]: ...
+
+    def fetchone(self) -> Optional[Tuple[Any, ...]]: ...
 
 
-class DoNothingFollowupJob(DoNothingJob, FollowupJob):
-    """The second most lazy class of dlt"""
+class DBApiCursor(SupportsReadableRelation):
+    """Protocol for DBAPI cursor"""
 
-    pass
+    description: Tuple[Any, ...]
+
+    native_cursor: "DBApiCursor"
+    """Cursor implementation native to current destination"""
+
+    def execute(self, query: AnyStr, *args: Any, **kwargs: Any) -> None: ...
+    def close(self) -> None: ...
+
+
+class SupportsReadableDataset(Protocol):
+    """A readable dataset retrieved from a destination, has support for creating readable relations for a query or table"""
+
+    def __call__(self, query: Any) -> SupportsReadableRelation: ...
+
+    def __getitem__(self, table: str) -> SupportsReadableRelation: ...
+
+    def __getattr__(self, table: str) -> SupportsReadableRelation: ...
 
 
 class JobClientBase(ABC):
-    capabilities: ClassVar[DestinationCapabilitiesContext] = None
-
-    def __init__(self, schema: Schema, config: DestinationClientConfiguration) -> None:
+    def __init__(
+        self,
+        schema: Schema,
+        config: DestinationClientConfiguration,
+        capabilities: DestinationCapabilitiesContext,
+    ) -> None:
         self.schema = schema
         self.config = config
+        self.capabilities = capabilities
 
     @abstractmethod
-    def initialize_storage(self, truncate_tables: Iterable[str] = None) -> None:
+    def initialize_storage(self, truncate_tables: Optional[Iterable[str]] = None) -> None:
         """Prepares storage to be used ie. creates database schema or file system folder. Truncates requested tables."""
         pass
 
@@ -271,6 +552,38 @@ class JobClientBase(ABC):
     def drop_storage(self) -> None:
         """Brings storage back into not initialized state. Typically data in storage is destroyed."""
         pass
+
+    def verify_schema(
+        self, only_tables: Iterable[str] = None, new_jobs: Iterable[ParsedLoadJobFileName] = None
+    ) -> List[PreparedTableSchema]:
+        """Verifies schema before loading, returns a list of verified loaded tables."""
+        if exceptions := verify_schema_capabilities(
+            self.schema,
+            self.capabilities,
+            self.config.destination_type,
+            warnings=False,
+        ):
+            for exception in exceptions:
+                logger.error(str(exception))
+            raise exceptions[0]
+
+        prepared_tables = [
+            self.prepare_load_table(table_name)
+            for table_name in set(
+                list(only_tables or []) + self.schema.data_table_names(seen_data_only=True)
+            )
+        ]
+        if exceptions := verify_supported_data_types(
+            prepared_tables,
+            new_jobs,
+            self.capabilities,
+            self.config.destination_type,
+            warnings=False,
+        ):
+            for exception in exceptions:
+                logger.error(str(exception))
+            raise exceptions[0]
+        return prepared_tables
 
     def update_stored_schema(
         self,
@@ -288,7 +601,6 @@ class JobClientBase(ABC):
         Returns:
             Optional[TSchemaTables]: Returns an update that was applied at the destination.
         """
-        self._verify_schema()
         # make sure that schema being saved was not modified from the moment it was loaded from storage
         version_hash = self.schema.version_hash
         if self.schema.is_modified:
@@ -297,23 +609,36 @@ class JobClientBase(ABC):
             )
         return expected_update
 
-    @abstractmethod
-    def start_file_load(self, table: TTableSchema, file_path: str, load_id: str) -> LoadJob:
-        """Creates and starts a load job for a particular `table` with content in `file_path`"""
-        pass
+    def prepare_load_table(self, table_name: str) -> PreparedTableSchema:
+        """Prepares a table schema to be loaded by filling missing hints and doing other modifications requires by given destination."""
+        try:
+            return fill_hints_from_parent_and_clone_table(self.schema.tables, self.schema.tables[table_name])  # type: ignore[return-value]
+
+        except KeyError:
+            raise UnknownTableException(self.schema.name, table_name)
 
     @abstractmethod
-    def restore_file_load(self, file_path: str) -> LoadJob:
-        """Finds and restores already started loading job identified by `file_path` if destination supports it."""
+    def create_load_job(
+        self, table: PreparedTableSchema, file_path: str, load_id: str, restore: bool = False
+    ) -> LoadJob:
+        """Creates a load job for a particular `table` with content in `file_path`. Table is already prepared to be loaded."""
         pass
 
-    def should_truncate_table_before_load(self, table: TTableSchema) -> bool:
-        return table["write_disposition"] == "replace"
+    def prepare_load_job_execution(  # noqa: B027, optional override
+        self, job: RunnableLoadJob
+    ) -> None:
+        """Prepare the connected job client for the execution of a load job (used for query tags in sql clients)"""
+        pass
+
+    def should_truncate_table_before_load(self, table_name: str) -> bool:
+        return self.prepare_load_table(table_name)["write_disposition"] == "replace"
 
     def create_table_chain_completed_followup_jobs(
-        self, table_chain: Sequence[TTableSchema]
-    ) -> List[NewLoadJob]:
-        """Creates a list of followup jobs that should be executed after a table chain is completed"""
+        self,
+        table_chain: Sequence[PreparedTableSchema],
+        completed_table_chain_jobs: Optional[Sequence[LoadJobInfo]] = None,
+    ) -> List[FollowupJobRequest]:
+        """Creates a list of followup jobs that should be executed after a table chain is completed. Tables are already prepared to be loaded."""
         return []
 
     @abstractmethod
@@ -331,118 +656,14 @@ class JobClientBase(ABC):
     ) -> None:
         pass
 
-    def _verify_schema(self) -> None:
-        """Verifies and cleans up a schema before loading
-
-        * Checks all table and column name lengths against destination capabilities and raises on too long identifiers
-        * Removes and warns on (unbound) incomplete columns
-        """
-
-        for table in self.schema.data_tables():
-            table_name = table["name"]
-            if len(table_name) > self.capabilities.max_identifier_length:
-                raise IdentifierTooLongException(
-                    self.config.destination_type,
-                    "table",
-                    table_name,
-                    self.capabilities.max_identifier_length,
-                )
-            if table.get("write_disposition") == "merge":
-                if "x-merge-strategy" in table and table["x-merge-strategy"] not in MERGE_STRATEGIES:  # type: ignore[typeddict-item]
-                    raise SchemaException(
-                        f'"{table["x-merge-strategy"]}" is not a valid merge strategy. '  # type: ignore[typeddict-item]
-                        f"""Allowed values: {', '.join(['"' + s + '"' for s in MERGE_STRATEGIES])}."""
-                    )
-                if (
-                    table.get("x-merge-strategy") == "delete-insert"
-                    and not has_column_with_prop(table, "primary_key")
-                    and not has_column_with_prop(table, "merge_key")
-                ):
-                    logger.warning(
-                        f"Table {table_name} has `write_disposition` set to `merge`"
-                        " and `merge_strategy` set to `delete-insert`, but no primary or"
-                        " merge keys defined."
-                        " dlt will fall back to `append` for this table."
-                    )
-            if has_column_with_prop(table, "hard_delete"):
-                if len(get_columns_names_with_prop(table, "hard_delete")) > 1:
-                    raise SchemaException(
-                        f'Found multiple "hard_delete" column hints for table "{table_name}" in'
-                        f' schema "{self.schema.name}" while only one is allowed:'
-                        f' {", ".join(get_columns_names_with_prop(table, "hard_delete"))}.'
-                    )
-                if table.get("write_disposition") in ("replace", "append"):
-                    logger.warning(
-                        f"""The "hard_delete" column hint for column "{get_first_column_name_with_prop(table, 'hard_delete')}" """
-                        f'in table "{table_name}" with write disposition'
-                        f' "{table.get("write_disposition")}"'
-                        f' in schema "{self.schema.name}" will be ignored.'
-                        ' The "hard_delete" column hint is only applied when using'
-                        ' the "merge" write disposition.'
-                    )
-            if has_column_with_prop(table, "dedup_sort"):
-                if len(get_columns_names_with_prop(table, "dedup_sort")) > 1:
-                    raise SchemaException(
-                        f'Found multiple "dedup_sort" column hints for table "{table_name}" in'
-                        f' schema "{self.schema.name}" while only one is allowed:'
-                        f' {", ".join(get_columns_names_with_prop(table, "dedup_sort"))}.'
-                    )
-                if table.get("write_disposition") in ("replace", "append"):
-                    logger.warning(
-                        f"""The "dedup_sort" column hint for column "{get_first_column_name_with_prop(table, 'dedup_sort')}" """
-                        f'in table "{table_name}" with write disposition'
-                        f' "{table.get("write_disposition")}"'
-                        f' in schema "{self.schema.name}" will be ignored.'
-                        ' The "dedup_sort" column hint is only applied when using'
-                        ' the "merge" write disposition.'
-                    )
-                if table.get("write_disposition") == "merge" and not has_column_with_prop(
-                    table, "primary_key"
-                ):
-                    logger.warning(
-                        f"""The "dedup_sort" column hint for column "{get_first_column_name_with_prop(table, 'dedup_sort')}" """
-                        f'in table "{table_name}" with write disposition'
-                        f' "{table.get("write_disposition")}"'
-                        f' in schema "{self.schema.name}" will be ignored.'
-                        ' The "dedup_sort" column hint is only applied when a'
-                        " primary key has been specified."
-                    )
-            for column_name, column in dict(table["columns"]).items():
-                if len(column_name) > self.capabilities.max_column_identifier_length:
-                    raise IdentifierTooLongException(
-                        self.config.destination_type,
-                        "column",
-                        f"{table_name}.{column_name}",
-                        self.capabilities.max_column_identifier_length,
-                    )
-                if not is_complete_column(column):
-                    logger.warning(
-                        f"A column {column_name} in table {table_name} in schema"
-                        f" {self.schema.name} is incomplete. It was not bound to the data during"
-                        " normalizations stage and its data type is unknown. Did you add this"
-                        " column manually in code ie. as a merge key?"
-                    )
-
-    def prepare_load_table(
-        self, table_name: str, prepare_for_staging: bool = False
-    ) -> TTableSchema:
-        try:
-            # make a copy of the schema so modifications do not affect the original document
-            table = deepcopy(self.schema.tables[table_name])
-            # add write disposition if not specified - in child tables
-            if "write_disposition" not in table:
-                table["write_disposition"] = get_write_disposition(self.schema.tables, table_name)
-            if "table_format" not in table:
-                table["table_format"] = get_table_format(self.schema.tables, table_name)
-            return table
-        except KeyError:
-            raise UnknownTableException(table_name)
-
 
 class WithStateSync(ABC):
     @abstractmethod
-    def get_stored_schema(self) -> Optional[StorageSchemaInfo]:
-        """Retrieves newest schema from destination storage"""
+    def get_stored_schema(self, schema_name: str = None) -> Optional[StorageSchemaInfo]:
+        """
+        Retrieves newest schema with given name from destination storage
+        If no name is provided, the newest schema found is retrieved.
+        """
         pass
 
     @abstractmethod
@@ -460,7 +681,7 @@ class WithStagingDataset(ABC):
     """Adds capability to use staging dataset and request it from the loader"""
 
     @abstractmethod
-    def should_load_data_to_staging_dataset(self, table: TTableSchema) -> bool:
+    def should_load_data_to_staging_dataset(self, table_name: str) -> bool:
         return False
 
     @abstractmethod
@@ -469,20 +690,32 @@ class WithStagingDataset(ABC):
         return self  # type: ignore
 
 
-class SupportsStagingDestination:
+class SupportsStagingDestination(ABC):
     """Adds capability to support a staging destination for the load"""
 
-    def should_load_data_to_staging_dataset_on_staging_destination(
-        self, table: TTableSchema
-    ) -> bool:
+    def should_load_data_to_staging_dataset_on_staging_destination(self, table_name: str) -> bool:
+        """If set to True, and staging destination is configured, the data will be loaded to staging dataset on staging destination
+        instead of a regular dataset on staging destination. Currently it is used by Athena Iceberg which uses staging dataset
+        on staging destination to copy data to iceberg tables stored on regular dataset on staging destination.
+        The default is to load data to regular dataset on staging destination from where warehouses like Snowflake (that have their
+        own storage) will copy data.
+        """
         return False
 
-    def should_truncate_table_before_load_on_staging_destination(self, table: TTableSchema) -> bool:
-        # the default is to truncate the tables on the staging destination...
-        return True
+    @abstractmethod
+    def should_truncate_table_before_load_on_staging_destination(self, table_name: str) -> bool:
+        """If set to True, data in `table` will be truncated on staging destination (regular dataset). This is the default behavior which
+        can be changed with a config flag.
+        For Athena + Iceberg this setting is always False - Athena uses regular dataset to store Iceberg tables and we avoid touching it.
+        For Athena we truncate those tables only on "replace" write disposition.
+        """
+        pass
 
 
-TDestinationReferenceArg = Union[str, "Destination", Callable[..., "Destination"], None]
+# TODO: type Destination properly
+TDestinationReferenceArg = Union[
+    str, "Destination[Any, Any]", Callable[..., "Destination[Any, Any]"], None
+]
 
 
 class Destination(ABC, Generic[TDestinationConfig, TDestinationClient]):
@@ -490,7 +723,10 @@ class Destination(ABC, Generic[TDestinationConfig, TDestinationClient]):
     with credentials and other config params.
     """
 
-    config_params: Optional[Dict[str, Any]] = None
+    config_params: Dict[str, Any]
+    """Explicit config params, overriding any injected or default values."""
+    caps_params: Dict[str, Any]
+    """Explicit capabilities params, overriding any default values for this destination"""
 
     def __init__(self, **kwargs: Any) -> None:
         # Create initial unresolved destination config
@@ -498,9 +734,27 @@ class Destination(ABC, Generic[TDestinationConfig, TDestinationClient]):
         # to supersede config from the environment or pipeline args
         sig = inspect.signature(self.__class__.__init__)
         params = sig.parameters
-        self.config_params = {
-            k: v for k, v in kwargs.items() if k not in params or v != params[k].default
-        }
+
+        # get available args
+        spec = self.spec
+        spec_fields = spec.get_resolvable_fields()
+        caps_fields = DestinationCapabilitiesContext.get_resolvable_fields()
+
+        # remove default kwargs
+        kwargs = {k: v for k, v in kwargs.items() if k not in params or v != params[k].default}
+
+        # warn on unknown params
+        for k in list(kwargs):
+            if k not in spec_fields and k not in caps_fields:
+                logger.warning(
+                    f"When initializing destination factory of type {self.destination_type},"
+                    f" argument {k} is not a valid field in {spec.__name__} or destination"
+                    " capabilities"
+                )
+                kwargs.pop(k)
+
+        self.config_params = {k: v for k, v in kwargs.items() if k in spec_fields}
+        self.caps_params = {k: v for k, v in kwargs.items() if k in caps_fields}
 
     @property
     @abstractmethod
@@ -508,9 +762,37 @@ class Destination(ABC, Generic[TDestinationConfig, TDestinationClient]):
         """A spec of destination configuration that also contains destination credentials"""
         ...
 
+    def capabilities(
+        self, config: Optional[TDestinationConfig] = None, naming: Optional[NamingConvention] = None
+    ) -> DestinationCapabilitiesContext:
+        """Destination capabilities ie. supported loader file formats, identifier name lengths, naming conventions, escape function etc.
+        Explicit caps arguments passed to the factory init and stored in `caps_params` are applied.
+
+        If `config` is provided, it is used to adjust the capabilities, otherwise the explicit config composed just of `config_params` passed
+          to factory init is applied
+        If `naming` is provided, the case sensitivity and case folding are adjusted.
+        """
+        caps = self._raw_capabilities()
+        caps.update(self.caps_params)
+        # get explicit config if final config not passed
+        if config is None:
+            # create mock credentials to avoid credentials being resolved
+            init_config = self.spec()
+            init_config.update(self.config_params)
+            credentials = self.spec.credentials_type(init_config)()
+            credentials.__is_resolved__ = True
+            config = self.spec(credentials=credentials)
+            try:
+                config = self.configuration(config, accept_partial=True)
+            except Exception:
+                # in rare cases partial may fail ie. when invalid native value is present
+                # in that case we fallback to "empty" config
+                pass
+        return self.adjust_capabilities(caps, config, naming)
+
     @abstractmethod
-    def capabilities(self) -> DestinationCapabilitiesContext:
-        """Destination capabilities ie. supported loader file formats, identifier name lengths, naming conventions, escape function etc."""
+    def _raw_capabilities(self) -> DestinationCapabilitiesContext:
+        """Returns raw capabilities, before being adjusted with naming convention and config"""
         ...
 
     @property
@@ -533,15 +815,60 @@ class Destination(ABC, Generic[TDestinationConfig, TDestinationClient]):
         """A job client class responsible for starting and resuming load jobs"""
         ...
 
-    def configuration(self, initial_config: TDestinationConfig) -> TDestinationConfig:
+    def configuration(
+        self, initial_config: TDestinationConfig, accept_partial: bool = False
+    ) -> TDestinationConfig:
         """Get a fully resolved destination config from the initial config"""
+
         config = resolve_configuration(
-            initial_config,
+            initial_config or self.spec(),
             sections=(known_sections.DESTINATION, self.destination_name),
             # Already populated values will supersede resolved env config
             explicit_value=self.config_params,
+            accept_partial=accept_partial,
         )
         return config
+
+    def client(
+        self, schema: Schema, initial_config: TDestinationConfig = None
+    ) -> TDestinationClient:
+        """Returns a configured instance of the destination's job client"""
+        config = self.configuration(initial_config)
+        return self.client_class(schema, config, self.capabilities(config, schema.naming))
+
+    @classmethod
+    def adjust_capabilities(
+        cls,
+        caps: DestinationCapabilitiesContext,
+        config: TDestinationConfig,
+        naming: Optional[NamingConvention],
+    ) -> DestinationCapabilitiesContext:
+        """Adjust the capabilities to match the case sensitivity as requested by naming convention."""
+        # if naming not provided, skip the adjustment
+        if not naming or not naming.is_case_sensitive:
+            # all destinations are configured to be case insensitive so there's nothing to adjust
+            return caps
+        if not caps.has_case_sensitive_identifiers:
+            if caps.casefold_identifier is str:
+                logger.info(
+                    f"Naming convention {naming.name()} is case sensitive but the destination does"
+                    " not support case sensitive identifiers. Nevertheless identifier casing will"
+                    " be preserved in the destination schema."
+                )
+            else:
+                logger.warn(
+                    f"Naming convention {naming.name()} is case sensitive but the destination does"
+                    " not support case sensitive identifiers. Destination will case fold all the"
+                    f" identifiers with {caps.casefold_identifier}"
+                )
+        else:
+            # adjust case folding to store casefold identifiers in the schema
+            if caps.casefold_identifier is not str:
+                caps.casefold_identifier = str
+                logger.info(
+                    f"Enabling case sensitive identifiers for naming convention {naming.name()}"
+                )
+        return caps
 
     @staticmethod
     def to_name(ref: TDestinationReferenceArg) -> str:
@@ -555,7 +882,7 @@ class Destination(ABC, Generic[TDestinationConfig, TDestinationClient]):
 
     @staticmethod
     def normalize_type(destination_type: str) -> str:
-        """Normalizes destination type string into a canonical form. Assumes that type names without dots correspond to build in destinations."""
+        """Normalizes destination type string into a canonical form. Assumes that type names without dots correspond to built in destinations."""
         if "." not in destination_type:
             destination_type = "dlt.destinations." + destination_type
         # the next two lines shorten the dlt internal destination paths to dlt.destinations.<destination_type>
@@ -568,7 +895,7 @@ class Destination(ABC, Generic[TDestinationConfig, TDestinationClient]):
     @staticmethod
     def from_reference(
         ref: TDestinationReferenceArg,
-        credentials: Optional[CredentialsConfiguration] = None,
+        credentials: Optional[Any] = None,
         destination_name: Optional[str] = None,
         environment: Optional[str] = None,
         **kwargs: Any,
@@ -617,12 +944,6 @@ class Destination(ABC, Generic[TDestinationConfig, TDestinationClient]):
         except Exception as e:
             raise InvalidDestinationReference(ref) from e
         return dest
-
-    def client(
-        self, schema: Schema, initial_config: TDestinationConfig = config.value
-    ) -> TDestinationClient:
-        """Returns a configured instance of the destination's job client"""
-        return self.client_class(schema, self.configuration(initial_config))
 
 
 TDestination = Destination[DestinationClientConfiguration, JobClientBase]

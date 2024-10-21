@@ -10,9 +10,11 @@ keywords: [Databricks, destination, data warehouse]
 *Big thanks to Evan Phillips and [swishbi.com](https://swishbi.com/) for contributing code, time, and a test environment.*
 
 ## Install dlt with Databricks
+
 **To install the dlt library with Databricks dependencies:**
+
 ```sh
-pip install dlt[databricks]
+pip install "dlt[databricks]"
 ```
 
 ## Set up your Databricks workspace
@@ -22,7 +24,7 @@ To use the Databricks destination, you need:
 * A Databricks workspace with a Unity Catalog metastore connected
 * A Gen 2 Azure storage account and container
 
-If you already have your Databricks workspace set up, you can skip to the [Loader setup Guide](#loader-setup-guide).
+If you already have your Databricks workspace set up, you can skip to the [Loader setup guide](#loader-setup-guide).
 
 ### 1. Create a Databricks workspace in Azure
 
@@ -33,7 +35,7 @@ If you already have your Databricks workspace set up, you can skip to the [Loade
 2. Create an ADLS Gen 2 storage account
 
     Search for "Storage accounts" in the Azure Portal and create a new storage account.
-    Make sure it's a Data Lake Storage Gen 2 account, you do this by enabling "hierarchical namespace" when creating the account. Refer to the [Azure documentation](https://learn.microsoft.com/en-us/azure/storage/blobs/create-data-lake-storage-account) for further info.
+    Make sure it's a Data Lake Storage Gen 2 account by enabling "hierarchical namespace" when creating the account. Refer to the [Azure documentation](https://learn.microsoft.com/en-us/azure/storage/blobs/create-data-lake-storage-account) for further information.
 
 3. Create a container in the storage account
 
@@ -46,7 +48,7 @@ If you already have your Databricks workspace set up, you can skip to the [Loade
 
 5. Grant access to your storage container
 
-    Navigate to the storage container you created before and select "Access control (IAM)" in the left-hand menu.
+    Navigate to the storage container you created earlier and select "Access control (IAM)" in the left-hand menu.
 
     Add a new role assignment and select "Storage Blob Data Contributor" as the role. Under "Members" select "Managed Identity" and add the Databricks Access Connector you created in the previous step.
 
@@ -75,7 +77,7 @@ If you already have your Databricks workspace set up, you can skip to the [Loade
 
 6. Click "+ Add" again and select "Add external location"
 
-    Set the URL of our storage container. This should be in the form: `abfss://<container_name>@<storage_account_name>.dfs.core.windows.net/<path>`
+    Set the URL of your storage container. This should be in the form: `abfss://<container_name>@<storage_account_name>.dfs.core.windows.net/<path>`
 
     Once created, you can test the connection to make sure the container is accessible from Databricks.
 
@@ -88,24 +90,27 @@ If you already have your Databricks workspace set up, you can skip to the [Loade
     Click your email in the top right corner and go to "User Settings". Go to "Developer" -> "Access Tokens".
     Generate a new token and save it. You will use it in your `dlt` configuration.
 
-## Loader setup Guide
+## Loader setup guide
 
 **1. Initialize a project with a pipeline that loads to Databricks by running**
+
 ```sh
 dlt init chess databricks
 ```
 
 **2. Install the necessary dependencies for Databricks by running**
+
 ```sh
 pip install -r requirements.txt
 ```
-This will install dlt with **databricks** extra which contains Databricks Python dbapi client.
+
+This will install dlt with the `databricks` extra, which contains the Databricks Python dbapi client.
 
 **4. Enter your credentials into `.dlt/secrets.toml`.**
 
-This should have your connection parameters and your personal access token.
+This should include your connection parameters and your personal access token.
 
-You will find your server hostname and HTTP path in the Databricks workspace dashboard. Go to "SQL Warehouses", select your warehouse (default is called "Starter Warehouse") and go to "Connection details".
+You can find your server hostname and HTTP path in the Databricks workspace dashboard. Go to "SQL Warehouses", select your warehouse (default is called "Starter Warehouse"), and go to "Connection details".
 
 Example:
 
@@ -117,8 +122,10 @@ access_token = "MY_ACCESS_TOKEN"
 catalog = "my_catalog"
 ```
 
+See [staging support](#staging-support) for authentication options when `dlt` copies files from buckets.
+
 ## Write disposition
-All write dispositions are supported
+All write dispositions are supported.
 
 ## Data loading
 Data is loaded using `INSERT VALUES` statements by default.
@@ -127,24 +134,23 @@ Efficient loading from a staging filesystem is also supported by configuring an 
 For more information on staging, see the [staging support](#staging-support) section below.
 
 ## Supported file formats
-* [insert-values](../file-formats/insert-format.md) is used by default
-* [jsonl](../file-formats/jsonl.md) supported when staging is enabled (see limitations below)
-* [parquet](../file-formats/parquet.md) supported when staging is enabled
+* [insert-values](../file-formats/insert-format.md) is used by default.
+* [JSONL](../file-formats/jsonl.md) supported when staging is enabled (see limitations below).
+* [Parquet](../file-formats/parquet.md) supported when staging is enabled.
 
-The `jsonl` format has some limitations when used with Databricks:
+The JSONL format has some limitations when used with Databricks:
 
-1. Compression must be disabled to load jsonl files in Databricks. Set `data_writer.disable_compression` to `true` in dlt config when using this format.
-2. The following data types are not supported when using `jsonl` format with `databricks`: `decimal`, `complex`, `date`, `binary`. Use `parquet` if your data contains these types.
-3. `bigint` data type with precision is not supported with `jsonl` format
-
+1. Compression must be disabled to load jsonl files in Databricks. Set `data_writer.disable_compression` to `true` in the dlt config when using this format.
+2. The following data types are not supported when using the JSONL format with `databricks`: `decimal`, `json`, `date`, `binary`. Use `parquet` if your data contains these types.
+3. The `bigint` data type with precision is not supported with the `jsonl` format.
 
 ## Staging support
 
-Databricks supports both Amazon S3 and Azure Blob Storage as staging locations. `dlt` will upload files in `parquet` format to the staging location and will instruct Databricks to load data from there.
+Databricks supports both Amazon S3, Azure Blob Storage and Google Cloud Storage as staging locations. `dlt` will upload files in Parquet format to the staging location and will instruct Databricks to load data from there.
 
 ### Databricks and Amazon S3
 
-Please refer to the [S3 documentation](./filesystem.md#aws-s3) for details on connecting your S3 bucket with the bucket_url and credentials.
+Please refer to the [S3 documentation](./filesystem.md#aws-s3) for details on connecting your S3 bucket with the `bucket_url` and `credentials`.
 
 Example to set up Databricks with S3 as a staging destination:
 
@@ -164,7 +170,18 @@ pipeline = dlt.pipeline(
 
 ### Databricks and Azure Blob Storage
 
-Refer to the [Azure Blob Storage filesystem documentation](./filesystem.md#azure-blob-storage) for details on connecting your Azure Blob Storage container with the bucket_url and credentials.
+Refer to the [Azure Blob Storage filesystem documentation](./filesystem.md#azure-blob-storage) for details on connecting your Azure Blob Storage container with the `bucket_url` and `credentials`.
+
+To enable support for Azure Blob Storage with dlt, make sure to install the necessary dependencies by running:
+
+```sh
+pip install "dlt[az]"
+```
+
+:::note
+Databricks requires that you use ABFS URLs in the following format: `abfss://container_name@storage_account_name.dfs.core.windows.net/path`.
+dlt is able to adapt the other representation (i.e., `az://container-name/path`), but we recommend that you use the correct form.
+:::
 
 Example to set up Databricks with Azure as a staging destination:
 
@@ -175,12 +192,40 @@ Example to set up Databricks with Azure as a staging destination:
 pipeline = dlt.pipeline(
     pipeline_name='chess_pipeline',
     destination='databricks',
-    staging=dlt.destinations.filesystem('az://your-container-name'), # add this to activate the staging location
+    staging=dlt.destinations.filesystem('abfss://dlt-ci-data@dltdata.dfs.core.windows.net'), # add this to activate the staging location
     dataset_name='player_data'
 )
 ```
+
+### Databricks and Google Cloud Storage
+
+In order to load from Google Cloud Storage stage you must set-up the credentials via **named credential**. See below. Databricks does not allow to pass Google Credentials
+explicitly in SQL Statements.
+
+### Use external locations and stored credentials
+`dlt` forwards bucket credentials to the `COPY INTO` SQL command by default. You may prefer to use [external locations or stored credentials instead](https://docs.databricks.com/en/sql/language-manual/sql-ref-external-locations.html#external-location) that are stored on the Databricks side.
+
+If you set up an external location for your staging path, you can tell `dlt` to use it:
+```toml
+[destination.databricks]
+is_staging_external_location=true
+```
+
+If you set up Databricks credentials named, for example, **credential_x**, you can tell `dlt` to use it:
+```toml
+[destination.databricks]
+staging_credentials_name="credential_x"
+```
+
+Both options are available from code:
+```py
+import dlt
+
+bricks = dlt.destinations.databricks(staging_credentials_name="credential_x")
+```
+
 ### dbt support
-This destination [integrates with dbt](../transformations/dbt/dbt.md) via [dbt-databricks](https://github.com/databricks/dbt-databricks)
+This destination [integrates with dbt](../transformations/dbt/dbt.md) via [dbt-databricks](https://github.com/databricks/dbt-databricks).
 
 ### Syncing of `dlt` state
 This destination fully supports [dlt state sync](../../general-usage/state#syncing-state-with-destination).

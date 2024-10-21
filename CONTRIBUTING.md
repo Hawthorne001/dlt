@@ -4,7 +4,7 @@ Thank you for considering contributing to **dlt**! We appreciate your help in ma
 
 ## Table of Contents
 
-1. [Getting Started](#getting-started)
+1. [Getting Started](#intro)
 2. [Submitting Changes](#submitting-changes)
 3. [Adding or updating core dependencies](#adding-or-updating-core-dependencies)
 4. [Linting](#linting)
@@ -51,6 +51,28 @@ We use **devel** (which is our default Github branch) to prepare a next release 
 We use **master** branch for hot fixes (including documentation) that needs to be released out of the normal schedule.
 
 On the release day, **devel** branch is merged into **master**. All releases of `dlt` happen only from the **master**.
+
+### Branch naming rules
+
+We want to make sure that our git history explains in a human readable way what has been changed with which Branch or PR. To this end, we are using the following branch naming pattern (all lowercase and dashes, no underscores):
+
+```sh
+{category}/{ticket-id}-description-of-the-branch
+# example:
+feat/4922-add-avro-support
+```
+
+#### Branch categories
+
+* **feat** - a new feature that is being implemented (ticket required)
+* **fix** - a change that fixes a bug (ticket required)
+* **exp** - an experiment where we are testing a new  idea or want to demonstrate something to the team, might turn into a `feat` later (ticket encouraged)
+* **test** - anything related to the tests (ticket encouraged)
+* **docs** - a change to our docs (ticket optional)
+
+#### Ticket Numbers
+
+We encourage you to attach your branches to a ticket, if none exists, create one and explain what you are doing. For `feat` and `fix` branches, tickets are mandatory, for `exp` and `test` branches encouraged and for `docs` branches optional.
 
 ### Submitting a hotfix
 We'll fix critical bugs and release `dlt` out of the schedule. Follow the regular procedure, but make your PR against **master** branch. Please ping us on Slack if you do it.
@@ -166,3 +188,4 @@ Once the version has been bumped, follow these steps to publish the new release 
 - [Poetry Documentation](https://python-poetry.org/docs/)
 
 If you have any questions or need help, don't hesitate to reach out to us. We're here to help you succeed in contributing to `dlt`. Happy coding!
+****
